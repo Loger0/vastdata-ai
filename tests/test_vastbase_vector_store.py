@@ -473,7 +473,10 @@ class TestDenseSearch:
         assert result.nodes[0].node_id == "n1"
         assert result.nodes[0].text == "Hello"
         assert result.nodes[1].node_id == "n2"
-        assert result.similarities == [0.1, 0.5]
+        # L2 distance→similarity: 1/(1+distance)
+        expected_s0 = 1.0 / (1.0 + 0.1)  # ≈0.9091
+        expected_s1 = 1.0 / (1.0 + 0.5)  # ≈0.6667
+        assert result.similarities == [expected_s0, expected_s1]
         assert result.ids == ["n1", "n2"]
 
         mock_client.search.assert_called_once()
@@ -642,3 +645,168 @@ class TestHybridSearch:
 
         assert len(result.nodes) == 1
         assert result.nodes[0].node_id == "n1"
+
+
+# ── TEXT_SEARCH / SPARSE tests ────────────────────────────────────────────
+
+
+class TestTextSearch:
+    """query() with TEXT_SEARCH / SPARSE mode — text-only via ILIKE."""
+
+    def _make_text_hits(self):
+        """Build dict hits that mimic client.query() return values."""
+        return [
+            {
+                "id": "t1",
+                "text": "First match",
+                "embedding": [0.1],
+                "metadata_": {"key": "val1"},
+                "ref_doc_id": "doc-a",
+            },
+            {
+                "id": "t2",
+                "text": "Second match",
+                "embedding": [0.2],
+                "metadata_": {},
+                "ref_doc_id": "doc-b",
+            },
+        ]
+
+    def test_text_search_returns_dict_results(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.query.return_value = self._make_text_hits()
+
+        query = VectorStoreQuery(
+            query_str="First match",
+            similarity_top_k=3,
+            mode=VectorStoreQueryMode.TEXT_SEARCH,
+        )
+        result = store.query(query)
+
+        assert len(result.nodes) == 2
+        assert result.nodes[0].node_id == "t1"
+        assert result.nodes[0].text == "First match"
+        assert result.nodes[1].node_id == "t2"
+        # Verify client.query() was called (not client.search())
+        mock_client.query.assert_called_once()
+        mock_client.search.assert_not_called()
+
+    def test_sparse_mode_behaves_like_text_search(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.query.return_value = self._make_text_hits()
+
+        query = VectorStoreQuery(
+            query_str="First match",
+            similarity_top_k=3,
+            mode=VectorStoreQueryMode.SPARSE,
+        )
+        result = store.query(query)
+
+        assert len(result.nodes) == 2
+        mock_client.query.assert_called_once()
+
+    def test_text_search_no_query_str_returns_empty(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+
+        query = VectorStoreQuery(
+            similarity_top_k=3,
+            mode=VectorStoreQueryMode.TEXT_SEARCH,
+            # No query_str → should return empty
+        )
+        result = store.query(query)
+
+        assert result.nodes == []
+        assert result.similarities == []
+        assert result.ids == []
+        # Neither client.search() nor client.query() should be called
+        mock_client.search.assert_not_called()
+        mock_client.query.assert_not_called()
+
+    def test_text_search_with_filters(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.query.return_value = [
+            {"id": "t1", "text": "Filtered", "embedding": None, "metadata_": {}, "ref_doc_id": ""}
+        ]
+
+        filters = MetadataFilters(
+            filters=[MetadataFilter(key="author", value="Alice", operator="==")]
+        )
+        query = VectorStoreQuery(
+            query_str="Filtered",
+            similarity_top_k=3,
+            mode=VectorStoreQueryMode.TEXT_SEARCH,
+            filters=filters,
+        )
+        result = store.query(query)
+
+        assert len(result.nodes) == 1
+        mock_client.query.assert_called_once()
+        call_kwargs = mock_client.query.call_args.kwargs
+        assert "author" in str(call_kwargs.get("expr", ""))
+        assert "ILIKE" in str(call_kwargs.get("expr", ""))
+
+
+# ── Graceful fallback tests ────────────────────────────────────────────────
+
+
+class TestGracefulFallback:
+    """query() with no embedding but with query_str → graceful text-search fallback."""
+
+    def test_default_mode_no_embedding_falls_back_to_text(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.query.return_value = [
+            {"id": "fb1", "text": "Fallback result", "embedding": None, "metadata_": {}, "ref_doc_id": ""}
+        ]
+
+        query = VectorStoreQuery(
+            query_str="Fallback result",
+            similarity_top_k=3,
+            mode=VectorStoreQueryMode.DEFAULT,
+            # No query_embedding → graceful text-search fallback
+        )
+        result = store.query(query)
+
+        assert len(result.nodes) == 1
+        assert result.nodes[0].node_id == "fb1"
+        assert result.nodes[0].text == "Fallback result"
+        mock_client.query.assert_called_once()
+
+    def test_fallback_preserves_filters(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.query.return_value = [
+            {"id": "fb2", "text": "Filtered fallback", "embedding": None, "metadata_": {"k": "v"}, "ref_doc_id": ""}
+        ]
+
+        filters = MetadataFilters(
+            filters=[MetadataFilter(key="tag", value="urgent", operator="==")]
+        )
+        query = VectorStoreQuery(
+            query_str="fallback",
+            similarity_top_k=5,
+            mode=VectorStoreQueryMode.DEFAULT,
+            filters=filters,
+            # No query_embedding
+        )
+        result = store.query(query)
+
+        assert len(result.nodes) == 1
+        call_kwargs = mock_client.query.call_args.kwargs
+        assert "tag" in str(call_kwargs.get("expr", ""))

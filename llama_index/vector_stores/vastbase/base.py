@@ -313,28 +313,53 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         return ""
 
     @staticmethod
-    def _parse_search_hits(hits: Sequence[Any]) -> tuple:
+    def _parse_search_hits(
+        hits: Sequence[Any],
+    ) -> tuple[List[TextNode], List[float], List[str]]:
         """Convert pyvastbase search hits into parallel lists.
 
+        Supports both ``client.search()`` results (objects with ``.id``,
+        ``.distance``, ``.entity``) and ``client.query()`` results
+        (plain dicts with top-level ``id``, ``text``, etc.).
+
         Args:
-            hits: Iterable of search-hit objects.  Each hit should have
-                ``.id``, ``.distance``, and ``.entity`` (dict or object).
+            hits: Iterable of search-hit objects or dicts.
 
         Returns:
             Tuple of ``(nodes, similarities, ids)`` where each is a list.
+            For L2/COSINE metrics, similarities are converted from distances
+            so higher = more similar.
         """
         nodes: List[TextNode] = []
         similarities: List[float] = []
         ids: List[str] = []
 
         for hit in hits:
-            entity = getattr(hit, "entity", None) or {}
-
-            node_id: Optional[str] = entity.get("id", getattr(hit, "id", None))
-            text: str = entity.get("text", "")
-            embedding: Optional[List[float]] = entity.get("embedding")
-            metadata: dict = entity.get("metadata_", {}) or {}
-            ref_doc_id: Optional[str] = entity.get("ref_doc_id")
+            # ADAPT: client.search() returns objects with .entity;
+            # client.query() returns plain dicts.  Handle both.
+            if isinstance(hit, dict):
+                node_id = hit.get("id")
+                text = hit.get("text", "")
+                embedding = hit.get("embedding")
+                metadata = hit.get("metadata_", {}) or {}
+                ref_doc_id = hit.get("ref_doc_id")
+                # dicts from query() have no distance field; default to 0.0
+                distance = 0.0
+            else:
+                entity = getattr(hit, "entity", None) or {}
+                if isinstance(entity, dict):
+                    node_id = entity.get("id", getattr(hit, "id", None))
+                    text = entity.get("text", "")
+                    embedding = entity.get("embedding")
+                    metadata = entity.get("metadata_", {}) or {}
+                    ref_doc_id = entity.get("ref_doc_id")
+                else:
+                    node_id = getattr(entity, "id", getattr(hit, "id", None))
+                    text = getattr(entity, "text", "")
+                    embedding = getattr(entity, "embedding", None)
+                    metadata = getattr(entity, "metadata_", {}) or {}
+                    ref_doc_id = getattr(entity, "ref_doc_id", None)
+                distance = float(getattr(hit, "distance", 0.0))
 
             node = TextNode(
                 id_=node_id,
@@ -349,7 +374,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                 )
 
             nodes.append(node)
-            similarities.append(float(getattr(hit, "distance", 0.0)))
+            similarities.append(distance)
             ids.append(str(node_id) if node_id is not None else "")
 
         return nodes, similarities, ids
@@ -362,6 +387,12 @@ class VastbaseVectorStore(BasePydanticVectorStore):
 
         ADAPT: Vastbase V3 supports L2 (``<->``), COSINE (``<=>``), and
         IP (``<#>``) distance operators natively — no pgvector extension.
+
+        Distance→similarity conversion:
+        * L2 / COSINE — smaller distance = more similar.
+          ``similarity = 1.0 / (1.0 + distance)``.
+        * IP — larger value = more similar (already a similarity metric).
+          Kept as-is.
 
         Args:
             query: ``VectorStoreQuery`` with ``query_embedding`` populated.
@@ -392,7 +423,16 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
         hits = search_results[0]
-        nodes, similarities, ids = self._parse_search_hits(hits)
+        nodes, raw_scores, ids = self._parse_search_hits(hits)
+
+        # ADAPT: Convert distance to similarity for L2/COSINE metrics.
+        # IP is already a similarity (higher = more similar), keep as-is.
+        metric_upper = self.distance_metric.upper()
+        if metric_upper in ("L2", "COSINE"):
+            similarities = [1.0 / (1.0 + s) for s in raw_scores]
+        else:
+            similarities = raw_scores
+
         return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
 
     def _hybrid_search(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
@@ -420,9 +460,20 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         Returns:
             ``VectorStoreQueryResult`` with fused results.
         """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
         alpha = query.alpha if query.alpha is not None else 0.7
         filter_expr = self._prepare_search(query)
         top_k = query.similarity_top_k
+
+        # ADAPT: Helper to extract the id from either a dict (client.query())
+        # or an object (client.search()) hit — both appear in fusion loops.
+        def _hit_id(hit: Any) -> str:
+            if isinstance(hit, dict):
+                return hit.get("id", "")
+            return str(getattr(hit, "id", ""))
 
         # ── 1. Dense recall (oversample for fusion headroom) ──────────
         dense_limit = max(top_k * 3, 10)
@@ -453,25 +504,34 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                 )
                 text_hits = list(text_raw) if text_raw else []
             except Exception:
+                # ADAPT: log and continue — text recall failure should not
+                # abort the entire search; dense results are still usable.
+                logger.warning(
+                    "Text recall query failed for table=%s expr=%r — "
+                    "falling back to pure dense results.",
+                    self.table_name,
+                    text_expr,
+                    exc_info=True,
+                )
                 text_hits = []
 
         # ── 3. Score fusion ───────────────────────────────────────────
         dense_scores: dict[str, float] = {}
         for hit in dense_hits:
-            hid = getattr(hit, "id", "")
+            hid = _hit_id(hit)
             dist = float(getattr(hit, "distance", 1.0))
             # Convert distance to similarity: 1/(1+distance)
             dense_scores[hid] = 1.0 / (1.0 + dist)
 
         text_rank: dict[str, int] = {}
         for rank, hit in enumerate(text_hits):
-            hid = getattr(hit, "id", "")
+            hid = _hit_id(hit)
             if hid:
                 text_rank[hid] = rank + 1  # 1-indexed rank
 
         fused: dict[str, tuple] = {}  # id → (combined_score, hit)
         for hit in dense_hits:
-            hid = getattr(hit, "id", "")
+            hid = _hit_id(hit)
             dense_s = dense_scores.get(hid, 0.0)
             t_rank = text_rank.get(hid, len(text_hits) + 1)
             text_s = 1.0 / float(t_rank)  # reciprocal rank
@@ -479,7 +539,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             fused[hid] = (combined, hit)
 
         for hit in text_hits:
-            hid = getattr(hit, "id", "")
+            hid = _hit_id(hit)
             if hid in fused:
                 continue
             t_rank = text_rank.get(hid, 1)
@@ -494,7 +554,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         if not ranked:
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
-        nodes, similarities, ids = self._parse_search_hits(
+        nodes, _, ids = self._parse_search_hits(
             [item[1] for item in ranked]
         )
         # Override similarities with fused scores
