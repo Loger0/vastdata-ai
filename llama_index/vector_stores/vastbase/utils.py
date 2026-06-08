@@ -54,7 +54,10 @@ def _escape_value(value: Any) -> str:
         items = ", ".join(_escape_value(v) for v in value)
         return f"({items})"
 
-    return str(value)
+    raise TypeError(
+        f"Unsupported value type for SQL escaping: {type(value).__name__}. "
+        f"Expected str, int, float, bool, None, list, or tuple."
+    )
 
 
 def _render_metadata_filter(mf: MetadataFilter) -> str:
@@ -80,11 +83,13 @@ def _render_metadata_filter(mf: MetadataFilter) -> str:
         return f"{key} NOT IN {_escape_value(value)}"
 
     if op == FilterOperator.TEXT_MATCH:
+        escaped = str(value).replace("'", "''")
         # ADAPT: LIKE with % wildcards is standard SQL, Vastbase-compatible
-        return f"{key} LIKE '%{value}%'"
+        return f"{key} LIKE '%{escaped}%'"
 
     if op == FilterOperator.TEXT_MATCH_INSENSITIVE:
-        return f"{key} ILIKE '%{value}%'"
+        escaped = str(value).replace("'", "''")
+        return f"{key} ILIKE '%{escaped}%'"
 
     if op == FilterOperator.CONTAINS:
         # ADAPT: Vastbase supports PostgreSQL-compatible ANY(array) syntax

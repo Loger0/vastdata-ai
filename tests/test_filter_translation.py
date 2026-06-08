@@ -51,6 +51,11 @@ class TestEscapeValue:
     def test_tuple_value(self):
         assert _escape_value(("a", "b")) == "('a', 'b')"
 
+    def test_unsupported_type_raises(self):
+        """Unsupported types (dict, datetime, etc.) should raise TypeError."""
+        with pytest.raises(TypeError):
+            _escape_value({"key": "val"})
+
 
 # ── _to_vastbase_filter operator tests ───────────────────────────────
 
@@ -139,6 +144,24 @@ class TestOperatorTEXTMATCH:
         mf = MetadataFilter(key="description", value="vector", operator=FilterOperator.TEXT_MATCH)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
         assert result == "description LIKE '%vector%'"
+
+    def test_text_match_with_single_quote(self):
+        """Single quotes in value must be escaped to prevent SQL injection."""
+        mf = MetadataFilter(key="desc", value="it's tricky", operator=FilterOperator.TEXT_MATCH)
+        result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
+        assert result == "desc LIKE '%it''s tricky%'"
+
+    def test_text_match_with_percent(self):
+        """Percent sign in value — LIKE wildcard, stored as literal."""
+        mf = MetadataFilter(key="desc", value="100%", operator=FilterOperator.TEXT_MATCH)
+        result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
+        assert result == "desc LIKE '%100%%'"
+
+    def test_text_match_with_underscore(self):
+        """Underscore in value — LIKE wildcard, stored as literal."""
+        mf = MetadataFilter(key="desc", value="hello_world", operator=FilterOperator.TEXT_MATCH)
+        result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
+        assert result == "desc LIKE '%hello_world%'"
 
 
 class TestOperatorCONTAINS:
@@ -297,3 +320,12 @@ class TestTextMatchInsensitive:
         )
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
         assert result == "title ILIKE '%hello%'"
+
+    def test_text_match_insensitive_with_single_quote(self):
+        """Single quotes escaped in ILIKE value."""
+        mf = MetadataFilter(
+            key="title", value="it's a test",
+            operator=FilterOperator.TEXT_MATCH_INSENSITIVE,
+        )
+        result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
+        assert result == "title ILIKE '%it''s a test%'"
