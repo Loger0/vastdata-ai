@@ -13,7 +13,7 @@ from typing import Any, List, Optional, Sequence
 
 from pydantic import Field, PrivateAttr
 
-from llama_index.core.schema import BaseNode, TextNode
+from llama_index.core.schema import BaseNode, NodeRelationship, RelatedNodeInfo, TextNode
 from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
     MetadataFilters,
@@ -133,11 +133,13 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                 text: str = row.get("text", "")
                 embedding: Optional[List[float]] = row.get("embedding")
                 metadata: dict = row.get("metadata_", {}) or {}
+                ref_doc_id: Optional[str] = row.get("ref_doc_id")
             else:
                 node_id = getattr(row, "id", None)
                 text = getattr(row, "text", "")
                 embedding = getattr(row, "embedding", None)
                 metadata = getattr(row, "metadata_", {}) or {}
+                ref_doc_id = getattr(row, "ref_doc_id", None)
 
             node = TextNode(
                 id_=node_id,
@@ -145,6 +147,13 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                 embedding=embedding,
                 metadata=metadata,
             )
+            # ADAPT: ref_doc_id is stored as a separate column but LlamaIndex
+            # exposes it as a read-only property backed by source_node.
+            # Reconstruct the SOURCE relationship so node.ref_doc_id works.
+            if ref_doc_id:
+                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                    node_id=ref_doc_id
+                )
             nodes.append(node)
         return nodes
 
@@ -158,6 +167,11 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """Insert nodes into the Vastbase collection.
 
         Creates the collection automatically on first use.
+
+        .. note::
+            Nodes with ``ref_doc_id=None`` are stored with an empty string
+            (``""``) as their ``ref_doc_id``.  Callers should avoid passing
+            ``""`` to :meth:`delete` unless they intend to target those nodes.
 
         Args:
             nodes: Sequence of LlamaIndex BaseNode objects with embeddings.
@@ -189,9 +203,20 @@ class VastbaseVectorStore(BasePydanticVectorStore):
 
         Args:
             ref_doc_id: Source document ID whose nodes should be removed.
+                Must be a non-empty string.  An empty string or ``None``
+                will raise ``ValueError`` to avoid accidental mass-deletion
+                of nodes whose ``ref_doc_id`` was stored as empty.
+
+        Raises:
+            ValueError: If ``ref_doc_id`` is empty or ``None``.
         """
+        if not ref_doc_id:
+            raise ValueError("ref_doc_id must be a non-empty string")
         # ADAPT: VastbaseClient.delete() uses SQL expressions directly.
         # Escape single quotes for SQL safety.
+        # NOTE: This is a known limitation of pyvastbase's Milvus-style API.
+        # The expr parameter only accepts raw SQL strings; callers must ensure
+        # ref_doc_id values are sanitised before passing them in.
         escaped = ref_doc_id.replace("'", "''")
         self.client.delete(
             self.table_name,
@@ -213,7 +238,10 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """
         if not node_ids:
             return
-        # ADAPT: Escape single quotes for SQL safety — same pattern as delete()
+        # ADAPT: Escape single quotes for SQL safety — same pattern as delete().
+        # NOTE: pyvastbase's Milvus-style API accepts raw SQL expr strings.
+        # Single-quote escaping is the only practical defense without parameterised
+        # expressions; future maintainers should avoid adding unescaped user input.
         escaped_ids = ", ".join(
             "'" + nid.replace("'", "''") + "'" for nid in node_ids
         )
@@ -248,7 +276,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         results = self.client.query(
             self.table_name,
             expr=f"id IN ({escaped_ids})",
-            output_fields=["id", "text", "embedding", "metadata_"],
+            output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
         )
         return self._parse_results(results)
 

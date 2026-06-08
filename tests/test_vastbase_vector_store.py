@@ -8,7 +8,7 @@ import json
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
-from llama_index.core.schema import TextNode
+from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────
@@ -208,6 +208,45 @@ class TestAdd:
         inserted = mock_client.insert.call_args[0][1]
         assert inserted[0]["metadata_"] == {}
 
+    def test_add_node_with_ref_doc_id(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.has_collection.return_value = True
+
+        node = TextNode(
+            id_="n-ref",
+            text="With ref_doc_id",
+            embedding=[0.0],
+        )
+        # ADAPT: ref_doc_id is a read-only property backed by source_node;
+        # set it via the SOURCE relationship.
+        node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+            node_id="my-doc"
+        )
+        store.add([node])
+
+        inserted = mock_client.insert.call_args[0][1]
+        assert inserted[0]["ref_doc_id"] == "my-doc"
+
+    def test_add_node_ref_doc_id_none_stored_as_empty(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.has_collection.return_value = True
+
+        node = TextNode(
+            id_="n-no-ref",
+            text="No ref_doc_id",
+            embedding=[0.0],
+        )
+        store.add([node])
+
+        inserted = mock_client.insert.call_args[0][1]
+        assert inserted[0]["ref_doc_id"] == ""
+
 
 # ── delete() tests ──────────────────────────────────────────────────────
 
@@ -226,6 +265,15 @@ class TestDelete:
         call_expr = mock_client.delete.call_args[1]["expr"]
         assert "doc-123" in call_expr
         assert "ref_doc_id" in call_expr
+
+    def test_delete_empty_ref_doc_id_raises(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+
+        with pytest.raises(ValueError, match="ref_doc_id must be a non-empty string"):
+            store.delete("")
 
 
 # ── delete_nodes() tests ────────────────────────────────────────────────
@@ -270,15 +318,17 @@ class TestGetNodes:
         store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
         store._client = mock_client
         mock_client.query.return_value = [
-            {"id": "n1", "text": "Hello", "metadata_": {"k": "v"}},
-            {"id": "n3", "text": "World", "metadata_": {}},
+            {"id": "n1", "text": "Hello", "metadata_": {"k": "v"}, "ref_doc_id": "doc-1"},
+            {"id": "n3", "text": "World", "metadata_": {}, "ref_doc_id": "doc-3"},
         ]
 
         nodes = store.get_nodes(["n1", "n3"])
 
         assert len(nodes) == 2
         assert nodes[0].node_id == "n1"
+        assert nodes[0].ref_doc_id == "doc-1"
         assert nodes[1].node_id == "n3"
+        assert nodes[1].ref_doc_id == "doc-3"
         mock_client.query.assert_called_once()
         call_expr = mock_client.query.call_args[1]["expr"]
         assert "n1" in call_expr
@@ -301,13 +351,14 @@ class TestGetNodes:
         store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
         store._client = mock_client
         mock_client.query.return_value = [
-            {"id": "n42", "text": "Only one", "metadata_": {}},
+            {"id": "n42", "text": "Only one", "metadata_": {}, "ref_doc_id": "doc-42"},
         ]
 
         nodes = store.get_nodes(["n42"])
 
         assert len(nodes) == 1
         assert nodes[0].node_id == "n42"
+        assert nodes[0].ref_doc_id == "doc-42"
 
 
 # ── clear() tests ───────────────────────────────────────────────────────
