@@ -810,3 +810,228 @@ class TestGracefulFallback:
         assert len(result.nodes) == 1
         call_kwargs = mock_client.query.call_args.kwargs
         assert "tag" in str(call_kwargs.get("expr", ""))
+
+
+# ── Async API delegation tests ──────────────────────────────────────────
+# ADAPT: VastbaseVectorStore inherits async methods (async_add, aquery,
+# adelete, adelete_nodes, aget_nodes, aclear) from LlamaIndex's
+# BasePydanticVectorStore.  These methods delegate synchronously to their
+# sync counterparts.  The tests below verify correct delegation so callers
+# can safely use the async API.
+
+
+class TestAsyncAdd:
+    """async_add() delegates to add() and returns the same node IDs."""
+
+    @pytest.mark.asyncio
+    async def test_async_add_delegates_to_add(self, mock_client, sample_nodes):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.has_collection.return_value = True
+
+        node_ids = await store.async_add(sample_nodes)
+
+        assert node_ids == ["n1", "n2", "n3"]
+        mock_client.insert.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_add_single_node(self, mock_client, sample_nodes):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.has_collection.return_value = True
+
+        node_ids = await store.async_add([sample_nodes[0]])
+
+        assert node_ids == ["n1"]
+
+    @pytest.mark.asyncio
+    async def test_async_add_creates_collection_if_needed(self, mock_client, sample_nodes):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.has_collection.return_value = False
+
+        await store.async_add([sample_nodes[0]])
+
+        mock_client.create_collection.assert_called_once()
+
+
+class TestAsyncQuery:
+    """aquery() delegates to query() and returns matching results."""
+
+    @pytest.mark.asyncio
+    async def test_aquery_dense_returns_results(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+        from llama_index.core.vector_stores.types import VectorStoreQuery
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+
+        hit = _make_search_hit("n1", "Hello", [0.1, 0.2], {}, "", 0.1)
+        mock_client.search.return_value = [[hit]]
+
+        q = VectorStoreQuery(query_embedding=[0.1, 0.2], similarity_top_k=5)
+        result = await store.aquery(q)
+
+        assert len(result.nodes) == 1
+        assert result.nodes[0].node_id == "n1"
+        assert result.ids == ["n1"]
+        mock_client.search.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_aquery_no_embedding_returns_empty(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+        from llama_index.core.vector_stores.types import VectorStoreQuery
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+
+        q = VectorStoreQuery(query_embedding=None, query_str=None, similarity_top_k=5)
+        result = await store.aquery(q)
+
+        assert result.nodes == []
+        assert result.similarities == []
+        assert result.ids == []
+
+    @pytest.mark.asyncio
+    async def test_aquery_text_search_fallback(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+        from llama_index.core.vector_stores.types import VectorStoreQuery
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.query.return_value = [
+            {"id": "t1", "text": "Fallback result", "embedding": None, "metadata_": {}, "ref_doc_id": ""},
+        ]
+
+        q = VectorStoreQuery(query_str="Fallback result", similarity_top_k=3)
+        result = await store.aquery(q)
+
+        assert len(result.nodes) == 1
+        assert result.nodes[0].text == "Fallback result"
+
+
+class TestAsyncDelete:
+    """adelete() delegates to delete()."""
+
+    @pytest.mark.asyncio
+    async def test_adelete_delegates_to_delete(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+
+        await store.adelete("doc-xyz")
+
+        mock_client.delete.assert_called_once()
+        call_expr = mock_client.delete.call_args[1]["expr"]
+        assert "doc-xyz" in call_expr
+
+    @pytest.mark.asyncio
+    async def test_adelete_empty_ref_doc_id_raises(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+
+        with pytest.raises(ValueError, match="ref_doc_id must be a non-empty string"):
+            await store.adelete("")
+
+
+class TestAsyncDeleteNodes:
+    """adelete_nodes() delegates to delete_nodes()."""
+
+    @pytest.mark.asyncio
+    async def test_adelete_nodes_delegates_to_delete_nodes(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+
+        await store.adelete_nodes(["n1", "n2"])
+
+        mock_client.delete.assert_called_once()
+        call_expr = mock_client.delete.call_args[1]["expr"]
+        assert "n1" in call_expr
+        assert "n2" in call_expr
+
+    @pytest.mark.asyncio
+    async def test_adelete_nodes_empty_list_noop(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+
+        await store.adelete_nodes([])
+
+        mock_client.delete.assert_not_called()
+
+
+class TestAsyncGetNodes:
+    """aget_nodes() delegates to get_nodes()."""
+
+    @pytest.mark.asyncio
+    async def test_aget_nodes_returns_correct_nodes(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.query.return_value = [
+            {"id": "n1", "text": "Hello", "metadata_": {}, "ref_doc_id": None},
+            {"id": "n2", "text": "World", "metadata_": {}, "ref_doc_id": None},
+        ]
+
+        nodes = await store.aget_nodes(["n1", "n2"])
+
+        assert len(nodes) == 2
+        assert nodes[0].node_id == "n1"
+        assert nodes[1].node_id == "n2"
+        mock_client.query.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_aget_nodes_empty_list(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+
+        nodes = await store.aget_nodes([])
+
+        assert nodes == []
+        mock_client.query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_aget_nodes_with_ref_doc_id(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+        mock_client.query.return_value = [
+            {"id": "n42", "text": "With ref", "metadata_": {}, "ref_doc_id": "doc-42"},
+        ]
+
+        nodes = await store.aget_nodes(["n42"])
+
+        assert len(nodes) == 1
+        assert nodes[0].node_id == "n42"
+        assert nodes[0].ref_doc_id == "doc-42"
+
+
+class TestAsyncClear:
+    """aclear() delegates to clear()."""
+
+    @pytest.mark.asyncio
+    async def test_aclear_delegates_to_clear(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store._client = mock_client
+
+        await store.aclear()
+
+        mock_client.truncate_collection.assert_called_once_with(store.table_name)
