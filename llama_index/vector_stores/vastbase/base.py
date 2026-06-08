@@ -5,8 +5,8 @@ ADAPT: Vastbase V3 has a built-in vector engine compatible with
 PostgreSQL/pgvector. We wrap pyvastbase (VastbaseClient) to provide a
 Milvus-style interface that LlamaIndex's BasePydanticVectorStore expects.
 
-This module implements the CRUD operations: add, delete, delete_nodes,
-get_nodes, and clear. Search/query is stubbed out for a later phase.
+This module implements the CRUD operations and search (DENSE / HYBRID / TEXT)
+for the Vastbase vector store.
 """
 
 from typing import Any, List, Optional, Sequence
@@ -18,8 +18,11 @@ from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
     MetadataFilters,
     VectorStoreQuery,
+    VectorStoreQueryMode,
     VectorStoreQueryResult,
 )
+
+from llama_index.vector_stores.vastbase.utils import _to_vastbase_filter
 
 
 class VastbaseVectorStore(BasePydanticVectorStore):
@@ -53,6 +56,10 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     dimension: int = Field(
         default=1536,
         description="Vector embedding dimension",
+    )
+    distance_metric: str = Field(
+        default="L2",
+        description="Distance metric for vector search: L2, COSINE, or IP",
     )
 
     # ADAPT: use PrivateAttr for the lazy VastbaseClient — not a Pydantic field
@@ -290,7 +297,209 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """
         self.client.truncate_collection(self.table_name)
 
-    # ── Query (stub — reserved for next phase) ──────────────────────────
+    # ── Query / Search ────────────────────────────────────────────────────
+
+    def _prepare_search(self, query: VectorStoreQuery) -> str:
+        """Build a SQL WHERE clause from the query's metadata filters.
+
+        Args:
+            query: A ``VectorStoreQuery`` that may carry ``MetadataFilters``.
+
+        Returns:
+            SQL WHERE clause string (without ``WHERE``), or empty string.
+        """
+        if query.filters is not None:
+            return _to_vastbase_filter(query.filters)
+        return ""
+
+    @staticmethod
+    def _parse_search_hits(hits: Sequence[Any]) -> tuple:
+        """Convert pyvastbase search hits into parallel lists.
+
+        Args:
+            hits: Iterable of search-hit objects.  Each hit should have
+                ``.id``, ``.distance``, and ``.entity`` (dict or object).
+
+        Returns:
+            Tuple of ``(nodes, similarities, ids)`` where each is a list.
+        """
+        nodes: List[TextNode] = []
+        similarities: List[float] = []
+        ids: List[str] = []
+
+        for hit in hits:
+            entity = getattr(hit, "entity", None) or {}
+
+            node_id: Optional[str] = entity.get("id", getattr(hit, "id", None))
+            text: str = entity.get("text", "")
+            embedding: Optional[List[float]] = entity.get("embedding")
+            metadata: dict = entity.get("metadata_", {}) or {}
+            ref_doc_id: Optional[str] = entity.get("ref_doc_id")
+
+            node = TextNode(
+                id_=node_id,
+                text=text,
+                embedding=embedding,
+                metadata=metadata,
+            )
+            # ADAPT: reconstruct SOURCE relationship so node.ref_doc_id works.
+            if ref_doc_id:
+                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                    node_id=ref_doc_id
+                )
+
+            nodes.append(node)
+            similarities.append(float(getattr(hit, "distance", 0.0)))
+            ids.append(str(node_id) if node_id is not None else "")
+
+        return nodes, similarities, ids
+
+    def _dense_search(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
+        """Pure dense vector search using Vastbase's built-in vector engine.
+
+        Uses ``VastbaseClient.search()`` with the configured
+        ``distance_metric`` (L2, COSINE, or IP).
+
+        ADAPT: Vastbase V3 supports L2 (``<->``), COSINE (``<=>``), and
+        IP (``<#>``) distance operators natively — no pgvector extension.
+
+        Args:
+            query: ``VectorStoreQuery`` with ``query_embedding`` populated.
+
+        Returns:
+            ``VectorStoreQueryResult`` with ranked nodes, similarities, and ids.
+
+        Raises:
+            ValueError: If ``query_embedding`` is missing.
+        """
+        if not query.query_embedding:
+            raise ValueError("query_embedding is required for dense search")
+
+        filter_expr = self._prepare_search(query)
+
+        # ADAPT: VastbaseClient.search() accepts metric_type directly.
+        # Vastbase maps these to the native vector distance operators.
+        search_results = self.client.search(
+            self.table_name,
+            data=[query.query_embedding],
+            filter_expr=filter_expr,
+            limit=query.similarity_top_k,
+            output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
+            metric_type=self.distance_metric,
+        )
+
+        if not search_results or not search_results[0]:
+            return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
+
+        hits = search_results[0]
+        nodes, similarities, ids = self._parse_search_hits(hits)
+        return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
+
+    def _hybrid_search(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
+        """Hybrid search combining dense vector + text (BM25) recall.
+
+        Strategy:
+        1. Dense recall — ``VastbaseClient.search()`` with oversampling.
+        2. Text recall — ``VastbaseClient.query()`` with ILIKE on the
+           ``text`` column when ``query_str`` is available.
+        3. Score fusion — weighted reciprocal-rank fusion (RRF-ish) with
+           the ``alpha`` parameter controlling dense weight (1.0 = pure
+           dense, 0.0 = pure text).
+
+        ADAPT: Text recall uses standard SQL ILIKE — Vastbase is
+        PostgreSQL-compatible and supports this natively.  For BM25-grade
+        relevance scoring a FULLTEXT index can be added later via
+        ``VastbaseClient.create_index()``; the ILIKE path provides a
+        zero-config fallback.
+
+        Args:
+            query: ``VectorStoreQuery`` with both ``query_embedding`` and
+                ``query_str``.  Falls back to pure dense if ``query_str``
+                is missing.
+
+        Returns:
+            ``VectorStoreQueryResult`` with fused results.
+        """
+        alpha = query.alpha if query.alpha is not None else 0.7
+        filter_expr = self._prepare_search(query)
+        top_k = query.similarity_top_k
+
+        # ── 1. Dense recall (oversample for fusion headroom) ──────────
+        dense_limit = max(top_k * 3, 10)
+        dense_raw = self.client.search(
+            self.table_name,
+            data=[query.query_embedding] if query.query_embedding else [[0.0] * self.dimension],
+            filter_expr=filter_expr,
+            limit=dense_limit,
+            output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
+            metric_type=self.distance_metric,
+        )
+        dense_hits = dense_raw[0] if dense_raw else []
+
+        # ── 2. Text recall ────────────────────────────────────────────
+        text_hits: List[Any] = []
+        if query.query_str:
+            # ADAPT: escape the query string for SQL ILIKE safety.
+            escaped_str = query.query_str.replace("'", "''")
+            text_expr = f"text ILIKE '%{escaped_str}%'"
+            if filter_expr:
+                text_expr = f"({filter_expr}) AND ({text_expr})"
+            try:
+                text_raw = self.client.query(
+                    self.table_name,
+                    expr=text_expr,
+                    limit=dense_limit,
+                    output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
+                )
+                text_hits = list(text_raw) if text_raw else []
+            except Exception:
+                text_hits = []
+
+        # ── 3. Score fusion ───────────────────────────────────────────
+        dense_scores: dict[str, float] = {}
+        for hit in dense_hits:
+            hid = getattr(hit, "id", "")
+            dist = float(getattr(hit, "distance", 1.0))
+            # Convert distance to similarity: 1/(1+distance)
+            dense_scores[hid] = 1.0 / (1.0 + dist)
+
+        text_rank: dict[str, int] = {}
+        for rank, hit in enumerate(text_hits):
+            hid = getattr(hit, "id", "")
+            if hid:
+                text_rank[hid] = rank + 1  # 1-indexed rank
+
+        fused: dict[str, tuple] = {}  # id → (combined_score, hit)
+        for hit in dense_hits:
+            hid = getattr(hit, "id", "")
+            dense_s = dense_scores.get(hid, 0.0)
+            t_rank = text_rank.get(hid, len(text_hits) + 1)
+            text_s = 1.0 / float(t_rank)  # reciprocal rank
+            combined = alpha * dense_s + (1.0 - alpha) * text_s
+            fused[hid] = (combined, hit)
+
+        for hit in text_hits:
+            hid = getattr(hit, "id", "")
+            if hid in fused:
+                continue
+            t_rank = text_rank.get(hid, 1)
+            text_s = 1.0 / float(t_rank)
+            dense_s = 0.0
+            combined = alpha * dense_s + (1.0 - alpha) * text_s
+            fused[hid] = (combined, hit)
+
+        # Sort by combined score descending, take top_k
+        ranked = sorted(fused.values(), key=lambda x: x[0], reverse=True)[:top_k]
+
+        if not ranked:
+            return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
+
+        nodes, similarities, ids = self._parse_search_hits(
+            [item[1] for item in ranked]
+        )
+        # Override similarities with fused scores
+        fused_scores = [item[0] for item in ranked]
+        return VectorStoreQueryResult(nodes=nodes, similarities=fused_scores, ids=ids)
 
     def query(
         self,
@@ -299,10 +508,59 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     ) -> VectorStoreQueryResult:
         """Query the vector store.
 
-        .. note::
-            Search/query functionality will be implemented in a subsequent
-            issue.  Currently raises ``NotImplementedError``.
+        Dispatches based on ``query.mode``:
+
+        * ``DEFAULT`` / ``None`` → dense vector search
+        * ``SPARSE`` / ``TEXT_SEARCH`` → text-only search (requires ``query_str``)
+        * ``HYBRID`` → dense + text fusion
+
+        Args:
+            query: ``VectorStoreQuery`` carrying embedding, query string,
+                similarity_top_k, alpha, and optional metadata filters.
+
+        Returns:
+            ``VectorStoreQueryResult`` with matching nodes and scores.
         """
-        raise NotImplementedError(
-            "query() will be implemented in the next phase (VAS-10)"
-        )
+        mode = query.mode
+
+        if mode == VectorStoreQueryMode.HYBRID:
+            return self._hybrid_search(query)
+
+        if mode in (VectorStoreQueryMode.SPARSE, VectorStoreQueryMode.TEXT_SEARCH):
+            # ADAPT: text-only search uses ILIKE on the text column.
+            # For BM25-grade search a FULLTEXT index should be created first.
+            if not query.query_str:
+                return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
+            filter_expr = self._prepare_search(query)
+            escaped_str = query.query_str.replace("'", "''")
+            text_expr = f"text ILIKE '%{escaped_str}%'"
+            if filter_expr:
+                text_expr = f"({filter_expr}) AND ({text_expr})"
+            raw = self.client.query(
+                self.table_name,
+                expr=text_expr,
+                limit=query.similarity_top_k,
+                output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
+            )
+            nodes, similarities, ids = self._parse_search_hits(raw)
+            return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
+
+        # DEFAULT / fallback → dense vector search
+        # If query_embedding is missing, fall back to text search when query_str
+        # is available; otherwise return empty.
+        if not query.query_embedding:
+            if query.query_str:
+                # Use text-only search as graceful fallback
+                return self.query(
+                    VectorStoreQuery(
+                        query_str=query.query_str,
+                        mode=VectorStoreQueryMode.TEXT_SEARCH,
+                        similarity_top_k=query.similarity_top_k,
+                        filters=query.filters,
+                        alpha=query.alpha,
+                    ),
+                    **kwargs,
+                )
+            return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
+
+        return self._dense_search(query)
