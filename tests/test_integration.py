@@ -129,15 +129,10 @@ def vastbase_store():
 # ── CRUD integration tests ────────────────────────────────────────────
 
 
+@pytest.mark.skipif(not _VASTBASE_REACHABLE, reason=_NEEDS_VASTBASE.kwargs["reason"])
 @pytest.mark.usefixtures("vastbase_store")
 class TestCRUDIntegration:
     """Full CRUD lifecycle against a live Vastbase instance."""
-
-    @pytest.fixture(autouse=True)
-    def _mark_needs_vastbase(self):
-        """Per-class skip marker — checked on first test method entry."""
-        if not _VASTBASE_REACHABLE:
-            pytest.skip(_NEEDS_VASTBASE.kwargs["reason"])
 
     def test_add_and_retrieve_nodes(self, vastbase_store):
         """Insert nodes and retrieve them by ID."""
