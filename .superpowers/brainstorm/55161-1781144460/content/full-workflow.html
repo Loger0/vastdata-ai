@@ -1,0 +1,145 @@
+<h2>完整工作流 — Framework Analyzer 前置</h2>
+<p class="subtitle">两种集成模式的分支处理</p>
+
+<div style="background:#1a1a2e;padding:16px;border-radius:8px;margin-bottom:16px">
+  <h3 style="margin-top:0">🆕 Framework Analyzer 内部流程</h3>
+  <div style="display:flex;flex-direction:column;gap:8px;font-size:13px">
+
+    <div style="display:flex;align-items:center;gap:12px">
+      <div style="background:#e67e22;color:#fff;padding:6px 12px;border-radius:4px;min-width:120px;text-align:center;font-size:11px">Step 1</div>
+      <div style="flex:1;background:#0f3460;padding:8px 12px;border-radius:4px">
+        <strong>获取框架源码</strong> — 根据 Issue 提供的上游 URL，克隆到分析目录
+      </div>
+    </div>
+
+    <div style="display:flex;align-items:center;gap:12px">
+      <div style="background:#e67e22;color:#fff;padding:6px 12px;border-radius:4px;min-width:120px;text-align:center;font-size:11px">Step 2</div>
+      <div style="flex:1;background:#0f3460;padding:8px 12px;border-radius:4px">
+        <strong>诊断集成模式</strong> — 分析目录结构/模块组织，判断：独立包 还是 原生集成
+      </div>
+    </div>
+
+    <div style="display:flex;align-items:center;gap:12px">
+      <div style="background:#e67e22;color:#fff;padding:6px 12px;border-radius:4px;min-width:120px;text-align:center;font-size:11px">Step 3</div>
+      <div style="flex:1;background:#0f3460;padding:8px 12px;border-radius:4px">
+        <strong>分析耦合度</strong> — 找到向量数据库相关的抽象接口/注册机制/配置入口，列出需修改的文件清单
+      </div>
+    </div>
+
+    <div style="display:flex;align-items:center;gap:12px">
+      <div style="background:#e67e22;color:#fff;padding:6px 12px;border-radius:4px;min-width:120px;text-align:center;font-size:11px">Step 4</div>
+      <div style="flex:1;background:#0f3460;padding:8px 12px;border-radius:4px">
+        <strong>评估测试基础</strong> — 搜索测试目录/CI 配置，判断：有官方测试 / 部分覆盖 / 完全缺失
+      </div>
+    </div>
+
+    <div style="display:flex;align-items:center;gap:12px">
+      <div style="background:#e67e22;color:#fff;padding:6px 12px;border-radius:4px;min-width:120px;text-align:center;font-size:11px">Step 5</div>
+      <div style="flex:1;background:#0f3460;padding:8px 12px;border-radius:4px">
+        <strong>产出 Framework Profile</strong> — JSON 格式标注到 Parent Issue，驱动下游分支
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">路径 A：独立包模式（LangChain / LlamaIndex）</div>
+    <div class="mockup-body" style="font-size:12px;line-height:1.7">
+      <div style="padding:6px;background:#1a3a1a;border-radius:3px;margin-bottom:4px;font-size:11px;color:#8f8">
+        📋 Profile: 集成=独立包, 耦合=低, 测试=有, 修改文件=0
+      </div>
+      <div style="padding:6px;background:#16213e;border-radius:3px;margin-bottom:2px">
+        🟢 <strong>代码仓库</strong><br>
+        <small style="color:#aaa">Adapter 仓库 → 独立开发</small>
+      </div>
+      <div style="padding:6px;background:#16213e;border-radius:3px;margin-bottom:2px">
+        🔵 convention-extractor<br>
+        <small style="color:#aaa">提取框架接口规范</small>
+      </div>
+      <div style="padding:6px;background:#16213e;border-radius:3px;margin-bottom:2px">
+        🔵 test-scout<br>
+        <small style="color:#aaa">提取框架官方测试</small>
+      </div>
+      <div style="padding:6px;background:#16213e;border-radius:3px;margin-bottom:2px">
+        🔵 eco-issue-splitter<br>
+        <small style="color:#aaa">按接口方法拆分子任务</small>
+      </div>
+      <div style="padding:6px;background:#1a1a2e;border-radius:3px">
+        🔵 adapter-dev → code-reviewer → test-adapter
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">路径 B：原生集成模式（RAGFlow）</div>
+    <div class="mockup-body" style="font-size:12px;line-height:1.7">
+      <div style="padding:6px;background:#3a1a1a;border-radius:3px;margin-bottom:4px;font-size:11px;color:#faa">
+        📋 Profile: 集成=原生集成, 耦合=中高, 测试=无, 修改文件=3-5
+      </div>
+      <div style="padding:6px;background:#16213e;border-radius:3px;margin-bottom:2px">
+        🟠 <strong>代码仓库</strong><br>
+        <small style="color:#aaa">Fork RAGFlow → 在 fork 上直接修改源码</small>
+      </div>
+      <div style="padding:6px;background:#16213e;border-radius:3px;margin-bottom:2px">
+        🔵 convention-extractor<br>
+        <small style="color:#aaa">提取参照后端的代码规范 + 项目整体风格</small>
+      </div>
+      <div style="padding:6px;background:#16213e;border-radius:3px;margin-bottom:2px">
+        🆕 test-strategist<br>
+        <small style="color:#faa">无官方测试 → 规划 API 端到端集成测试方案</small>
+      </div>
+      <div style="padding:6px;background:#16213e;border-radius:3px;margin-bottom:2px">
+        🔵 eco-issue-splitter<br>
+        <small style="color:#aaa">拆分为：后端实现 + 配置修改 + 集成测试 子任务</small>
+      </div>
+      <div style="padding:6px;background:#1a1a2e;border-radius:3px">
+        🔵 adapter-dev → code-reviewer → test-adapter
+        <small style="color:#faa;display:block">（每个子任务的 test-adapter 执行自建测试）</small>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>代码仓库策略</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:12px">
+    <tr style="background:#16213e">
+      <th style="padding:8px;text-align:left">集成模式</th>
+      <th style="padding:8px;text-align:left">代码放在哪</th>
+      <th style="padding:8px;text-align:left">仓库操作</th>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px">独立包</td>
+      <td style="padding:8px">adapter Git 仓库（如 <code>llama-index-vector-stores-vastbase</code>）</td>
+      <td style="padding:8px">在 adapter 仓库上开发，框架源码只读分析</td>
+    </tr>
+    <tr>
+      <td style="padding:8px">原生集成</td>
+      <td style="padding:8px">Fork 目标框架仓库（如 <code>infiniflow/ragflow</code>）</td>
+      <td style="padding:8px">Fork → 在 fork 上创建 feature 分支 → 直接修改源码</td>
+    </tr>
+  </table>
+</div>
+
+<div class="section">
+  <h3>测试策略分支</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:12px">
+    <tr style="background:#16213e">
+      <th style="padding:8px;text-align:left">测试基础</th>
+      <th style="padding:8px;text-align:left">test-scout 策略</th>
+      <th style="padding:8px;text-align:left">test-adapter 策略</th>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><span style="color:#8f8">✅ 有官方测试</span></td>
+      <td style="padding:8px">提取 + 适配为 Vastbase 版本</td>
+      <td style="padding:8px">单元 + pyvastbase 集成 + 框架官方 + 框架集成（4层）</td>
+    </tr>
+    <tr>
+      <td style="padding:8px"><span style="color:#faa">❌ 无测试</span></td>
+      <td style="padding:8px">切换为 <strong>test-strategist</strong>：分析框架 API → 规划集成测试方案</td>
+      <td style="padding:8px">自建 API 端到端集成测试（全流程 demo）</td>
+    </tr>
+  </table>
+</div>

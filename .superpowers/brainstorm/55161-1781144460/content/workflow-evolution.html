@@ -1,0 +1,130 @@
+<h2>Multica 工作流演进 — 新增框架前置分析阶段</h2>
+<p class="subtitle">对比：当前 v5 流程 vs 新增 Framework Analyzer 后的流程</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">❌ 当前 v5 工作流（假设前提不成立）</div>
+    <div class="mockup-body" style="font-size:12px;line-height:1.8">
+      <div style="padding:8px;background:#1a2e1a;border-radius:4px;margin-bottom:4px">
+        🟢 Parent Issue 创建（人工填写框架信息）
+      </div>
+      <div style="text-align:center;margin:4px 0">⬇</div>
+      <div style="padding:8px;background:#16213e;border-radius:4px;margin-bottom:4px">
+        🔵 eco-issue-analyst（需求分析）
+      </div>
+      <div style="text-align:center;margin:4px 0">⬇</div>
+      <div style="padding:8px;background:#16213e;border-radius:4px;margin-bottom:4px">
+        🔵 convention-extractor（提取编码规范）
+      </div>
+      <div style="text-align:center;margin:4px 0">⬇</div>
+      <div style="padding:8px;background:#16213e;border-radius:4px;margin-bottom:4px">
+        🔵 test-scout（查找框架测试）
+      </div>
+      <div style="text-align:center;margin:4px 0">⬇</div>
+      <div style="padding:8px;background:#16213e;border-radius:4px;margin-bottom:4px">
+        🔵 eco-issue-splitter（拆分任务）
+      </div>
+      <div style="text-align:center;margin:4px 0">⬇</div>
+      <div style="padding:8px;background:#1a1a2e;border-radius:4px">
+        🔵 adapter-dev → code-reviewer → test-adapter
+      </div>
+      <div style="margin-top:8px;padding:8px;background:#3a1a1a;border-radius:4px;font-size:11px;color:#faa">
+        ⚠ 隐含假设：<br>
+        · 框架有清晰的抽象接口<br>
+        · 适配是独立包<br>
+        · 框架有官方测试<br>
+        · 耦合度低，不用改目标源码
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">✅ 新流程：Framework Analyzer 前置</div>
+    <div class="mockup-body" style="font-size:12px;line-height:1.8">
+      <div style="padding:8px;background:#1a2e1a;border-radius:4px;margin-bottom:4px">
+        🟢 Parent Issue 创建
+      </div>
+      <div style="text-align:center;margin:4px 0">⬇</div>
+      <div style="padding:8px;background:#e67e22;color:#fff;border-radius:4px;margin-bottom:4px;font-weight:bold">
+        🆕 <strong>Framework Analyzer</strong>（框架前置诊断）
+      </div>
+      <div style="text-align:center;margin:4px 0">⬇</div>
+      <div style="padding:8px;background:#0f3460;border-radius:4px;margin-bottom:2px;font-size:11px">
+        📋 <strong>产出：Framework Profile</strong>
+      </div>
+      <div style="display:flex;gap:4px;margin:4px 0">
+        <div style="flex:1;background:#1a1a2e;padding:6px;border-radius:3px;font-size:10px;text-align:center">
+          🏗️ 集成模式<br><small>独立包 / 原生集成 / 插件</small>
+        </div>
+        <div style="flex:1;background:#1a1a2e;padding:6px;border-radius:3px;font-size:10px;text-align:center">
+          🔗 耦合度<br><small>接口抽象 / 需改配置 / 深度耦合</small>
+        </div>
+        <div style="flex:1;background:#1a1a2e;padding:6px;border-radius:3px;font-size:10px;text-align:center">
+          🧪 测试基础<br><small>有官方测试 / 部分有 / 完全缺失</small>
+        </div>
+        <div style="flex:1;background:#1a1a2e;padding:6px;border-radius:3px;font-size:10px;text-align:center">
+          📝 需修改文件清单
+        </div>
+      </div>
+      <div style="text-align:center;margin:4px 0;font-size:11px;color:#e67e22">
+        ⬇ 标注到 Issue，下游 Agent 自动适配策略
+      </div>
+      <div style="padding:8px;background:#16213e;border-radius:4px;margin-bottom:4px">
+        🔵 eco-issue-analyst
+        <span style="font-size:10px;color:#aaa"><br>根据 Profile 切换分析模式</span>
+      </div>
+      <div style="padding:8px;background:#16213e;border-radius:4px;margin-bottom:4px">
+        🔵 convention-extractor
+        <span style="font-size:10px;color:#aaa"><br>根据集成模式调整规范提取策略</span>
+      </div>
+      <div style="padding:8px;background:#16213e;border-radius:4px;margin-bottom:4px">
+        🔵 test-scout / test-strategist
+        <span style="font-size:10px;color:#aaa"><br>有测试→提取 / 无测试→规划测试方案</span>
+      </div>
+      <div style="padding:8px;background:#1a1a2e;border-radius:4px">
+        🔵 后续 Agent 链自动适配
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Framework Analyzer 诊断输出：Framework Profile</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:12px">
+    <tr style="background:#16213e">
+      <th style="padding:8px;text-align:left">诊断维度</th>
+      <th style="padding:8px;text-align:left">LangChain / LlamaIndex</th>
+      <th style="padding:8px;text-align:left">RAGFlow</th>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><strong>集成模式</strong></td>
+      <td style="padding:8px"><span style="background:#1a3a1a;padding:2px 8px;border-radius:3px;color:#8f8">独立包</span></td>
+      <td style="padding:8px"><span style="background:#3a2a1a;padding:2px 8px;border-radius:3px;color:#fa8">原生集成</span></td>
+    </tr>
+    <tr>
+      <td style="padding:8px"><strong>耦合度</strong></td>
+      <td style="padding:8px">低 — 实现抽象接口即可</td>
+      <td style="padding:8px">中高 — 需修改配置/注册/路由等文件</td>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><strong>需修改的目标文件</strong></td>
+      <td style="padding:8px">0 个</td>
+      <td style="padding:8px">~3-5 个（settings, factory, constants 等）</td>
+    </tr>
+    <tr>
+      <td style="padding:8px"><strong>测试基础</strong></td>
+      <td style="padding:8px"><span style="background:#1a3a1a;padding:2px 8px;border-radius:3px;color:#8f8">框架有官方测试</span></td>
+      <td style="padding:8px"><span style="background:#3a1a1a;padding:2px 8px;border-radius:3px;color:#f88">完全缺失</span></td>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><strong>测试策略</strong></td>
+      <td style="padding:8px">提取官方测试 + 扩充</td>
+      <td style="padding:8px">全自建：API 端到端集成测试</td>
+    </tr>
+    <tr>
+      <td style="padding:8px"><strong>编码规范来源</strong></td>
+      <td style="padding:8px">框架 VectorStore 接口规范</td>
+      <td style="padding:8px">参照现有后端实现 + 项目整体风格</td>
+    </tr>
+  </table>
+</div>

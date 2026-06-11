@@ -1,0 +1,145 @@
+<h2>Framework Profile 输出格式 &amp; Agent 变更清单</h2>
+<p class="subtitle">Profile 是连接上游诊断和下游实现的契约</p>
+
+<div class="section">
+  <h3>Framework Profile JSON Schema</h3>
+  <div style="background:#0d1117;padding:16px;border-radius:6px;font-family:monospace;font-size:11px;line-height:1.6;overflow-x:auto">
+<span style="color:#ff7b72">{</span>
+  <span style="color:#79c0ff">"framework"</span>: <span style="color:#a5d6ff">"ragflow"</span>,
+  <span style="color:#79c0ff">"version"</span>: <span style="color:#a5d6ff">"0.18.0"</span>,
+  <span style="color:#79c0ff">"source_repo"</span>: <span style="color:#a5d6ff">"https://github.com/infiniflow/ragflow"</span>,
+
+  <span style="color:#8b949e">// ── 集成模式诊断 ──</span>
+  <span style="color:#79c0ff">"integration_mode"</span>: <span style="color:#a5d6ff">"native"</span>,              <span style="color:#8b949e">// "standalone" | "native" | "plugin"</span>
+  <span style="color:#79c0ff">"adapter_repo"</span>: <span style="color:#ff7b72">null</span>,                      <span style="color:#8b949e">// standalone 模式：adapter git repo URL</span>
+  <span style="color:#79c0ff">"fork_target"</span>: <span style="color:#a5d6ff">"infiniflow/ragflow"</span>,       <span style="color:#8b949e">// native 模式：需 fork 的目标仓库</span>
+
+  <span style="color:#8b949e">// ── 耦合度分析 ──</span>
+  <span style="color:#79c0ff">"coupling_level"</span>: <span style="color:#a5d6ff">"medium"</span>,                <span style="color:#8b949e">// "low" | "medium" | "high"</span>
+  <span style="color:#79c0ff">"files_to_modify"</span>: [
+    <span style="color:#a5d6ff">"api/settings.py"</span>,
+    <span style="color:#a5d6ff">"rag/utils/constants.py"</span>,
+    <span style="color:#a5d6ff">"rag/nlp/__init__.py"</span>
+  ],
+  <span style="color:#79c0ff">"files_to_create"</span>: [
+    <span style="color:#a5d6ff">"rag/nlp/vastbase_impl.py"</span>
+  ],
+
+  <span style="color:#8b949e">// ── 接口抽象分析 ──</span>
+  <span style="color:#79c0ff">"abstraction_type"</span>: <span style="color:#a5d6ff">"class_inheritance"</span>,       <span style="color:#8b949e">// "abstract_class" | "protocol" | "duck_typing" | "none"</span>
+  <span style="color:#79c0ff">"base_class"</span>: <span style="color:#a5d6ff">"rag.nlp.abstract.VectorDB"</span>,
+  <span style="color:#79c0ff">"reference_backend"</span>: <span style="color:#a5d6ff">"rag.nlp.infinity_impl"</span>,  <span style="color:#8b949e">// 最接近 Vastbase 的参照实现</span>
+  <span style="color:#79c0ff">"required_methods"</span>: [
+    <span style="color:#a5d6ff">"search"</span>, <span style="color:#a5d6ff">"insert"</span>, <span style="color:#a5d6ff">"delete"</span>, <span style="color:#a5d6ff">"create"</span>
+  ],
+
+  <span style="color:#8b949e">// ── 测试基础评估 ──</span>
+  <span style="color:#79c0ff">"test_infrastructure"</span>: <span style="color:#a5d6ff">"none"</span>,                 <span style="color:#8b949e">// "full" | "partial" | "none"</span>
+  <span style="color:#79c0ff">"test_directory"</span>: <span style="color:#ff7b72">null</span>,
+  <span style="color:#79c0ff">"test_strategy"</span>: <span style="color:#a5d6ff">"self_build_e2e"</span>,          <span style="color:#8b949e">// "extract_official" | "extend_partial" | "self_build_e2e"</span>
+
+  <span style="color:#8b949e">// ── Demo 规划 ──</span>
+  <span style="color:#79c0ff">"demo"</span>: {
+    <span style="color:#79c0ff">"type"</span>: <span style="color:#a5d6ff">"api_e2e_pipeline"</span>,            <span style="color:#8b949e">// 由 Analyzer 根据框架用途诊断</span>
+    <span style="color:#79c0ff">"scenarios"</span>: [
+      <span style="color:#a5d6ff">"knowledge_base_create"</span>,
+      <span style="color:#a5d6ff">"document_ingest_and_parse"</span>,
+      <span style="color:#a5d6ff">"vector_retrieval"</span>,
+      <span style="color:#a5d6ff">"hybrid_search_recall"</span>,
+      <span style="color:#a5d6ff">"knowledge_base_cleanup"</span>
+    ],
+    <span style="color:#79c0ff">"validation_criteria"</span>: <span style="color:#a5d6ff">"召回结果与预期一致；过滤条件下结果数量正确"</span>
+  },
+
+  <span style="color:#8b949e">// ── 编码规范引用 ──</span>
+  <span style="color:#79c0ff">"convention_references"</span>: [
+    <span style="color:#a5d6ff">"rag/nlp/infinity_impl.py"</span>,
+    <span style="color:#a5d6ff">"rag/nlp/elasticsearch_impl.py"</span>
+  ]
+<span style="color:#ff7b72">}</span>
+  </div>
+</div>
+
+<div class="section">
+  <h3>下游 Agent 变更清单</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:12px">
+    <tr style="background:#16213e">
+      <th style="padding:8px;text-align:left">Agent</th>
+      <th style="padding:8px;text-align:left">当前行为</th>
+      <th style="padding:8px;text-align:left">变更</th>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><strong>🆕 Framework Analyzer</strong></td>
+      <td style="padding:8px;color:#aaa">不存在</td>
+      <td style="padding:8px">
+        <span style="color:#8f8">新增 Agent</span>：克隆源码 → 诊断 → 产出 Profile JSON → 标注到 Issue
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:8px"><strong>eco-issue-analyst</strong></td>
+      <td style="padding:8px">假设独立包模式做需求分析</td>
+      <td style="padding:8px">
+        读取 Profile，根据 <code>integration_mode</code> 切换分析策略<br>
+        <span style="color:#faa">native 模式</span>：分析需修改的文件 + 参照后端逻辑<br>
+        <span style="color:#8f8">standalone 模式</span>：维持现有逻辑
+      </td>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><strong>convention-extractor</strong></td>
+      <td style="padding:8px">从框架接口提取编码规范</td>
+      <td style="padding:8px">
+        读取 Profile，根据 <code>integration_mode</code> 切换提取来源<br>
+        <span style="color:#faa">native 模式</span>：分析 <code>reference_backend</code> + 项目整体风格<br>
+        <span style="color:#8f8">standalone 模式</span>：维持现有逻辑
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:8px"><strong>test-scout</strong></td>
+      <td style="padding:8px">查找框架官方测试</td>
+      <td style="padding:8px">
+        读取 Profile，根据 <code>test_infrastructure</code> 切换角色：<br>
+        · <code>"full"</code> → 提取官方测试（现有逻辑）<br>
+        · <code>"none"</code> → 切换为 <strong>test-strategist</strong>：基于 Profile 的 <code>demo.scenarios</code> 规划集成测试方案
+      </td>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><strong>eco-issue-splitter</strong></td>
+      <td style="padding:8px">按接口方法拆分子任务</td>
+      <td style="padding:8px">
+        读取 Profile<br>
+        <span style="color:#faa">native 模式</span>：拆分时包含 "修改配置/注册文件" 子任务<br>
+        <span style="color:#8f8">standalone 模式</span>：维持现有逻辑
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:8px"><strong>adapter-dev</strong></td>
+      <td style="padding:8px">独立包 TDD 开发</td>
+      <td style="padding:8px">
+        读取 Profile<br>
+        <span style="color:#faa">native 模式</span>：在 fork 仓库上开发，Step A4.5 增加 "读取需修改文件清单"<br>
+        <span style="color:#8f8">standalone 模式</span>：维持现有逻辑
+      </td>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><strong>test-adapter</strong></td>
+      <td style="padding:8px">4 层测试</td>
+      <td style="padding:8px">
+        升级为 <strong>5 层测试</strong>，Flow C 增加第 5 层<br>
+        读取 Profile 的 <code>demo</code> 字段：按 <code>demo.scenarios</code> 编写 Demo<br>
+        读取 <code>test_strategy</code>：<code>"self_build_e2e"</code> 时跳过提取官方测试
+      </td>
+    </tr>
+  </table>
+</div>
+
+<div class="pros-cons">
+  <div class="pros"><h4>设计要点</h4><ul>
+    <li>Profile JSON 是唯一真相源，所有下游 Agent 读取同一份</li>
+    <li>Agent 不猜测框架特征，全部由 Analyzer 诊断</li>
+    <li>每个 Agent 只需要判断 integration_mode 等关键字段即可分流</li>
+  </ul></div>
+  <div class="cons"><h4>待确认</h4><ul>
+    <li>Profile JSON 应该标注在 Issue description 还是作为独立 artifact 文件？</li>
+    <li>Framework Analyzer 是否需要人工确认后才继续？</li>
+  </ul></div>
+</div>

@@ -1,0 +1,118 @@
+<h2>测试体系升级 — 从 4 层到 5 层，新增应用级 Demo</h2>
+<p class="subtitle">每层验证不同的东西，应用层确保"真实场景可用"</p>
+
+<div style="background:#1a1a2e;padding:16px;border-radius:8px;margin-bottom:16px">
+  <h3 style="margin-top:0">🔺 测试金字塔（当前 4 层 → 升级为 5 层）</h3>
+
+  <div style="position:relative;display:flex;flex-direction:column;align-items:center;gap:2px">
+
+    <div style="width:220px;background:#e74c3c;color:#fff;padding:10px 16px;border-radius:6px;text-align:center;font-size:12px">
+      <strong>🆕 第 5 层：应用级 Demo</strong><br>
+      <small>框架 + Vastbase 真实应用场景</small>
+    </div>
+    <div style="color:#aaa;font-size:11px">⬆ 最终验收：用户能用它做什么</div>
+
+    <div style="width:300px;background:#e67e22;color:#fff;padding:10px 16px;border-radius:6px;text-align:center;margin-top:6px;font-size:12px">
+      <strong>第 4 层：框架集成验收</strong><br>
+      <small>走框架高层 API 验证完整 RAG 链路</small>
+    </div>
+    <div style="color:#aaa;font-size:11px">⬆ 验证组装后没问题</div>
+
+    <div style="width:380px;background:#f39c12;color:#fff;padding:10px 16px;border-radius:6px;text-align:center;margin-top:6px;font-size:12px">
+      <strong>第 3 层：框架官方测试</strong><br>
+      <small>框架自身的 VectorStore 测试套件</small>
+    </div>
+    <div style="color:#aaa;font-size:11px">⬆ 验证符合框架规范</div>
+
+    <div style="width:460px;background:#27ae60;color:#fff;padding:10px 16px;border-radius:6px;text-align:center;margin-top:6px;font-size:12px">
+      <strong>第 2 层：pyvastbase 集成测试</strong><br>
+      <small>真实 Vastbase 连接，验证 SDK 兼容性</small>
+    </div>
+    <div style="color:#aaa;font-size:11px">⬆ 验证数据通路</div>
+
+    <div style="width:540px;background:#2980b9;color:#fff;padding:10px 16px;border-radius:6px;text-align:center;font-size:12px">
+      <strong>第 1 层：单元测试</strong><br>
+      <small>mock / 本地逻辑验证</small>
+    </div>
+
+  </div>
+</div>
+
+<div class="section">
+  <h3>第 5 层 Demo 规范：按框架定制</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:12px">
+    <tr style="background:#16213e">
+      <th style="padding:8px;text-align:left">框架</th>
+      <th style="padding:8px;text-align:left">Demo 形式</th>
+      <th style="padding:8px;text-align:left">验证点</th>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><strong>LangChain</strong></td>
+      <td style="padding:8px">简单聊天应用：LangChain + Vastbase 向量存储 + LLM</td>
+      <td style="padding:8px">
+        · 文档入库 → 向量检索召回<br>
+        · 带过滤条件的多轮对话<br>
+        · 混合搜索（dense+BM25）准确性
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:8px"><strong>LlamaIndex</strong></td>
+      <td style="padding:8px">知识库 RAG：VectorStoreIndex + as_query_engine</td>
+      <td style="padding:8px">
+        · 索引构建 → 查询 → 结果正确性<br>
+        · 元数据过滤 + 向量搜索组合<br>
+        · 节点增删改后索引一致性
+      </td>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><strong>RAGFlow</strong></td>
+      <td style="padding:8px">API 端到端：Create KB → Ingest Doc → Search → 验证召回</td>
+      <td style="padding:8px">
+        · 知识库创建 → 文档解析 → 入库<br>
+        · 向量检索 + 关键词检索 → 结果正确<br>
+        · 知识库删除/清理后数据一致性
+      </td>
+    </tr>
+  </table>
+</div>
+
+<div class="section">
+  <h3>Demo 在 Multica 流程中的位置</h3>
+  <div style="display:flex;align-items:center;gap:8px;font-size:12px;flex-wrap:wrap">
+    <div style="background:#16213e;padding:8px 12px;border-radius:4px">子 Issue 1-n: 4 层测试（每子Issue）</div>
+    <div style="color:#aaa">→</div>
+    <div style="background:#16213e;padding:8px 12px;border-radius:4px">所有子 Issue done</div>
+    <div style="color:#aaa">→</div>
+    <div style="background:#16213e;padding:8px 12px;border-radius:4px">父 Issue Flow C</div>
+    <div style="color:#aaa">→</div>
+    <div style="background:#e74c3c;color:#fff;padding:8px 12px;border-radius:4px;font-weight:bold">🆕 test-adapter 编写并运行应用级 Demo</div>
+    <div style="color:#aaa">→</div>
+    <div style="background:#16213e;padding:8px 12px;border-radius:4px">Demo 全部通过 ✅</div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Framework Profile 新增字段</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:12px">
+    <tr style="background:#16213e">
+      <th style="padding:8px;text-align:left">字段</th>
+      <th style="padding:8px;text-align:left">说明</th>
+      <th style="padding:8px;text-align:left">示例</th>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><code>demo_type</code></td>
+      <td style="padding:8px">Demo 形式</td>
+      <td style="padding:8px"><code>"chat_app"</code> / <code>"rag_pipeline"</code> / <code>"api_e2e"</code></td>
+    </tr>
+    <tr>
+      <td style="padding:8px"><code>demo_scenarios</code></td>
+      <td style="padding:8px">必须覆盖的场景列表</td>
+      <td style="padding:8px"><code>["ingest", "dense_search", "hybrid_search", "delete", "filter"]</code></td>
+    </tr>
+    <tr style="background:#1a1a2e">
+      <td style="padding:8px"><code>demo_validation</code></td>
+      <td style="padding:8px">验证标准</td>
+      <td style="padding:8px"><code>"召回 Top-3 与预期一致"</code> / <code>"过滤后结果数量正确"</code></td>
+    </tr>
+  </table>
+</div>

@@ -1,0 +1,56 @@
+<h2>设计总结 — RAGFlow 适配 + Multica 工作流演进</h2>
+<p class="subtitle">所有设计决策汇总</p>
+
+<table style="width:100%;border-collapse:collapse;font-size:12px">
+  <tr style="background:#16213e">
+    <th style="padding:8px;text-align:left;width:25%">模块</th>
+    <th style="padding:8px;text-align:left;width:37%">决策</th>
+    <th style="padding:8px;text-align:left;width:38%">关键细节</th>
+  </tr>
+  <tr style="background:#1a1a2e">
+    <td style="padding:8px"><strong>适配目标</strong></td>
+    <td style="padding:8px">RAGFlow 官方最新 release</td>
+    <td style="padding:8px">infiniflow/ragflow，让 Vastbase 成为其新增向量数据库后端</td>
+  </tr>
+  <tr>
+    <td style="padding:8px"><strong>集成模式</strong></td>
+    <td style="padding:8px">原生集成（在 RAGFlow 仓库内修改）</td>
+    <td style="padding:8px">Fork 目标仓库 → feature 分支开发 → 改源码</td>
+  </tr>
+  <tr style="background:#1a1a2e">
+    <td style="padding:8px"><strong>🆕 Framework Analyzer</strong></td>
+    <td style="padding:8px">工作流第一个 Agent，eco-issue-analyst 之前</td>
+    <td style="padding:8px">克隆源码 → 诊断 5 维 → 产出 Profile JSON → 标注到 Issue 评论区 → 等待人工审核</td>
+  </tr>
+  <tr>
+    <td style="padding:8px"><strong>Framework Profile</strong></td>
+    <td style="padding:8px">Issue 评论区存放，人工确认 Gate</td>
+    <td style="padding:8px">集成模式 / 耦合度 / 需修改文件 / 测试基础 / Demo 规划</td>
+  </tr>
+  <tr style="background:#1a1a2e">
+    <td style="padding:8px"><strong>代码仓库策略</strong></td>
+    <td style="padding:8px">按集成模式分叉</td>
+    <td style="padding:8px">独立包 → adapter 仓库；原生集成 → Fork 目标框架</td>
+  </tr>
+  <tr>
+    <td style="padding:8px"><strong>测试体系</strong></td>
+    <td style="padding:8px">4 层 → 5 层（新增应用级 Demo）</td>
+    <td style="padding:8px">第 5 层 Demo 由 Framework Analyzer 根据框架类型诊断决定</td>
+  </tr>
+  <tr style="background:#1a1a2e">
+    <td style="padding:8px"><strong>测试缺失处理</strong></td>
+    <td style="padding:8px">test-scout → test-strategist 角色切换</td>
+    <td style="padding:8px">无官方测试时自动规划集成测试方案，由 test-adapter 执行</td>
+  </tr>
+  <tr>
+    <td style="padding:8px"><strong>Agent 变更</strong></td>
+    <td style="padding:8px">7 个 Agent 需更新 / 新增</td>
+    <td style="padding:8px">1 新增 + 6 个现有 Agent 增加 Profile 读取和模式判断</td>
+  </tr>
+</table>
+</div>
+
+<div style="margin-top:20px;padding:12px;background:#1a3a1a;border-radius:6px;font-size:13px;color:#8f8">
+  ✅ 设计讨论完成。所有关键决策已确认。<br>
+  ⏭️ 下一步：编写设计文档 → 自审 → 提交 git → 你审阅后 → 进入实现计划。
+</div>

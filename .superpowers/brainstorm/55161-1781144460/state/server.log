@@ -1,0 +1,8 @@
+{"type":"server-started","port":65215,"host":"127.0.0.1","url_host":"localhost","url":"http://localhost:65215","screen_dir":"/Users/Admin/Desktop/生态适配/vastdata-ai/.superpowers/brainstorm/55161-1781144460/content","state_dir":"/Users/Admin/Desktop/生态适配/vastdata-ai/.superpowers/brainstorm/55161-1781144460/state"}
+{"type":"screen-added","file":"/Users/Admin/Desktop/生态适配/vastdata-ai/.superpowers/brainstorm/55161-1781144460/content/architecture-overview.html"}
+{"type":"screen-added","file":"/Users/Admin/Desktop/生态适配/vastdata-ai/.superpowers/brainstorm/55161-1781144460/content/workflow-evolution.html"}
+{"type":"screen-added","file":"/Users/Admin/Desktop/生态适配/vastdata-ai/.superpowers/brainstorm/55161-1781144460/content/full-workflow.html"}
+{"type":"screen-added","file":"/Users/Admin/Desktop/生态适配/vastdata-ai/.superpowers/brainstorm/55161-1781144460/content/testing-pyramid.html"}
+{"type":"screen-added","file":"/Users/Admin/Desktop/生态适配/vastdata-ai/.superpowers/brainstorm/55161-1781144460/content/profile-and-agents.html"}
+{"type":"screen-added","file":"/Users/Admin/Desktop/生态适配/vastdata-ai/.superpowers/brainstorm/55161-1781144460/content/summary.html"}
+{"type":"server-stopped","reason":"idle timeout"}

@@ -1,0 +1,73 @@
+<h2>RAGFlow Vastbase 适配 — 架构总览</h2>
+<p class="subtitle">对比：LangChain / LlamaIndex 独立包模式 vs RAGFlow 原生集成模式</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">模式一：LangChain / LlamaIndex（已完成）</div>
+    <div class="mockup-body" style="font-size:13px;line-height:1.6">
+      <div style="background:#1a1a2e;color:#e0e0e0;padding:12px;border-radius:6px;margin-bottom:10px">
+        <strong>独立适配包</strong><br>
+        langchain-vastbase / llama-index-vector-stores-vastbase
+      </div>
+      <div style="text-align:center;margin:8px 0">⬇ 实现</div>
+      <div style="background:#16213e;color:#e0e0e0;padding:12px;border-radius:6px;margin-bottom:10px">
+        <strong>框架抽象接口</strong><br>
+        VectorStore / BasePydanticVectorStore
+      </div>
+      <div style="text-align:center;margin:8px 0">⬇ 调用</div>
+      <div style="background:#0f3460;color:#e0e0e0;padding:12px;border-radius:6px;margin-bottom:10px">
+        <strong>pyvastbase SDK</strong>
+      </div>
+      <div style="text-align:center;margin:8px 0">⬇</div>
+      <div style="background:#533483;color:#e0e0e0;padding:12px;border-radius:6px">
+        <strong>Vastbase</strong>
+      </div>
+      <div style="margin-top:12px;padding:8px;background:#1a3a1a;border-radius:4px;font-size:11px;color:#8f8">
+        ✅ 适配包独立，不修改框架源码<br>
+        ✅ 框架有官方测试
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">模式二：RAGFlow 原生集成（本次）</div>
+    <div class="mockup-body" style="font-size:13px;line-height:1.6">
+      <div style="background:#1a1a2e;color:#e0e0e0;padding:12px;border-radius:6px;margin-bottom:10px">
+        <strong>RAGFlow 仓库</strong><br>
+        rag/ + api/ + web/
+      </div>
+      <div style="text-align:center;margin:8px 0">⬇ 修改</div>
+      <div style="background:#2d2d1a;color:#e0e0e0;padding:12px;border-radius:6px;margin-bottom:6px">
+        <strong>新增：Vastbase 后端模块</strong><br>
+        <code>rag/nlp/vastbase_impl.py</code>
+      </div>
+      <div style="background:#2d2d1a;color:#e0e0e0;padding:12px;border-radius:6px;margin-bottom:6px">
+        <strong>修改：配置/注册/路由</strong><br>
+        <code>settings.py + constants.py + factory.py</code>
+      </div>
+      <div style="text-align:center;margin:8px 0">⬇ 调用</div>
+      <div style="background:#0f3460;color:#e0e0e0;padding:12px;border-radius:6px;margin-bottom:10px">
+        <strong>pyvastbase SDK</strong>
+      </div>
+      <div style="text-align:center;margin:8px 0">⬇</div>
+      <div style="background:#533483;color:#e0e0e0;padding:12px;border-radius:6px">
+        <strong>Vastbase</strong>
+      </div>
+      <div style="margin-top:12px;padding:8px;background:#3a1a1a;border-radius:4px;font-size:11px;color:#faa">
+        ⚠ 适配代码在 RAGFlow 仓库内<br>
+        ⚠ 无官方测试，需自建
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>关键差异</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <tr style="background:#16213e"><th style="padding:8px;text-align:left">维度</th><th style="padding:8px;text-align:left">LangChain / LlamaIndex</th><th style="padding:8px;text-align:left">RAGFlow</th></tr>
+    <tr style="background:#1a1a2e"><td style="padding:8px">适配层位置</td><td style="padding:8px">独立 pip 包</td><td style="padding:8px">在 RAGFlow 仓库内新增</td></tr>
+    <tr><td style="padding:8px">对目标框架的修改</td><td style="padding:8px">零修改（实现接口即可）</td><td style="padding:8px">需修改注册/配置/路由等</td></tr>
+    <tr style="background:#1a1a2e"><td style="padding:8px">测试基础</td><td style="padding:8px">框架官方测试套件可用</td><td style="padding:8px">无，需全自建</td></tr>
+    <tr><td style="padding:8px">SDK 层</td><td style="padding:8px">pyvastbase（一致）</td><td style="padding:8px">pyvastbase（一致）</td></tr>
+  </table>
+</div>
