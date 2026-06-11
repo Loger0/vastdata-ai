@@ -44,7 +44,7 @@ Child Issues（并行或串行，按拆分策略）
 
 | Agent | ID | 阶段 |
 |-------|-----|:---:|
-| Framework Analyzer 🆕 | （注册后填入） | 阶段 0 |
+| Framework Analyzer 🆕 | 9102869c-2312-47a5-8c0e-b0c58e57ab5b | 阶段 0 |
 | eco-issue-analyst | b6d1747f-6237-46a8-a072-67632e208098 | 阶段 1 |
 | convention-extractor | e9fd48d4-22fc-466c-9c74-65da99ff8e9e | 阶段 1 |
 | test-scout | c3ae862b-87cf-48c9-a927-4a26d387b7b8 | 阶段 1 |
