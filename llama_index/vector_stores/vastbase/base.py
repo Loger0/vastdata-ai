@@ -47,6 +47,31 @@ FIELD_TEXT = "text"
 FIELD_METADATA = "metadata_"
 
 
+def _escape_sql_string(value: str) -> str:
+    """Escape a string for safe use in a SQL literal.
+
+    Doubles single quotes per SQL standard.
+    Also guards against backslash escape sequences.
+    """
+    return value.replace("'", "''").replace("\\", "\\\\")
+
+
+def _build_in_clause(column: str, values: List[str]) -> str:
+    """Build a safe SQL IN clause from a list of string values.
+
+    Args:
+        column: Column name (must be a known constant, NOT user input).
+        values: List of values to include in the IN clause.
+
+    Returns:
+        SQL expression like: node_id IN ('val1', 'val2')
+    """
+    if not values:
+        return "1=0"  # Always false, safe fallback
+    quoted = ", ".join(f"'{_escape_sql_string(v)}'" for v in values)
+    return f"{column} IN ({quoted})"
+
+
 def _entity_to_node(row: Dict) -> BaseNode:
     """Convert a Vastbase entity dict to a LlamaIndex BaseNode.
 
@@ -204,10 +229,12 @@ class VastbaseVectorStore(BasePydanticVectorStore):
 
     uri: str
     user: str
-    password: str
     table_name: str
     embed_dim: int = 1536
 
+    # ADAPT: password stored as PrivateAttr to prevent leak in repr/logs/model_dump.
+    # Upstream PGVectorStore uses SQLAlchemy connection_string (single opaque token).
+    _password: str = PrivateAttr(default="")
     _client: Any = PrivateAttr(default=None)
     _collection: Any = PrivateAttr(default=None)
     _is_initialized: bool = PrivateAttr(default=False)
@@ -224,11 +251,11 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         super().__init__(
             uri=uri,
             user=user,
-            password=password,
             table_name=table_name,
             embed_dim=embed_dim,
             **kwargs,
         )
+        self._password = password
 
     @classmethod
     def from_params(
@@ -264,19 +291,21 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         separate psycopg connection (which can cause pooling conflicts).
 
         ADAPT: pyvastbase's has_collection() has a bug where it only
-        checks the 'public' schema. We use a direct query via the
-        pyvastbase connection's underlying psycopg cursor.
+        checks the 'public' schema. We query information_schema.tables
+        without schema filter via the pyvastbase connection.
         """
         from pyvastbase import get_connection
 
         conn = get_connection("default")
         try:
-            cursor = conn._execute(
+            # ADAPT: Use conn._connection (psycopg3 Connection) public API
+            # instead of conn._execute() private method.
+            cur = conn._connection.execute(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
                 "WHERE table_name = %s)",
                 [self.table_name],
             )
-            row = cursor.fetchone()
+            row = cur.fetchone()
             return bool(row[0]) if row else False
         except Exception:
             # Fallback: assume table doesn't exist and try to create
@@ -292,17 +321,21 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         if self._is_initialized:
             return
 
-        from urllib.parse import urlparse
+        from urllib.parse import urlparse, quote
         from pyvastbase import connect
         from pyvastbase import Collection, CollectionSchema, FieldSchema, DataType
 
-        connection_uri = f"postgresql://{self.user}:{self.password}@{self.uri}"
+        # ADAPT: URL-encode password to handle special characters (@, :, /, etc.)
+        encoded_password = quote(self._password, safe="")
+        connection_uri = (
+            f"postgresql://{self.user}:{encoded_password}@{self.uri}"
+        )
         parsed = urlparse(connection_uri)
         host = parsed.hostname or "localhost"
         port = parsed.port or 5432
         database = (parsed.path or "/vastbase").lstrip("/") or "vastbase"
         user = parsed.username or self.user
-        password = parsed.password or self.password
+        password = parsed.password or self._password
 
         # ADAPT: Use pyvastbase connect() instead of SQLAlchemy create_engine.
         connect(
@@ -406,8 +439,8 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         if pks:
             # ADAPT: Use expr instead of pks — pyvastbase 0.2.0 pks path
             # has a bug with string PKs (psycopg ANY(%(pks)s) adapter issue).
-            quoted = ", ".join(f"'{pk}'" for pk in pks)
-            self._collection.delete(expr=f"{FIELD_NODE_ID} IN ({quoted})")
+            # Values are SQL-escaped via _escape_sql_string to prevent injection.
+            self._collection.delete(expr=_build_in_clause(FIELD_NODE_ID, pks))
 
     # ------------------------------------------------------------------
     # CRUD: delete_nodes
@@ -433,9 +466,8 @@ class VastbaseVectorStore(BasePydanticVectorStore):
 
         if node_ids and not filters:
             # ADAPT: Use expr instead of pks — pyvastbase 0.2.0 pks path
-            # has a bug with string PKs.
-            quoted = ", ".join(f"'{nid}'" for nid in node_ids)
-            self._collection.delete(expr=f"{FIELD_NODE_ID} IN ({quoted})")
+            # has a bug with string PKs. Values are SQL-escaped.
+            self._collection.delete(expr=_build_in_clause(FIELD_NODE_ID, node_ids))
             return
 
         # Query first, filter in Python, then delete
@@ -456,9 +488,8 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         pks = [row[FIELD_NODE_ID] for row in rows]
         if pks:
             # ADAPT: Use expr instead of pks — pyvastbase 0.2.0 pks path
-            # has a bug with string PKs.
-            quoted = ", ".join(f"'{pk}'" for pk in pks)
-            self._collection.delete(expr=f"{FIELD_NODE_ID} IN ({quoted})")
+            # has a bug with string PKs. Values are SQL-escaped.
+            self._collection.delete(expr=_build_in_clause(FIELD_NODE_ID, pks))
 
     # ------------------------------------------------------------------
     # CRUD: clear
@@ -467,11 +498,25 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     def clear(self) -> None:
         """Clear all nodes from the vector store.
 
-        ADAPT: Uses drop + recreate instead of TRUNCATE.
+        ADAPT: Uses drop + recreate with atomic safety. If create fails
+        after a successful drop, retries once to restore the collection.
         """
         self._initialize()
         self._collection.drop()
-        self._collection.create()
+        try:
+            self._collection.create()
+        except Exception:
+            _logger.error(
+                "Failed to recreate collection %s after clear(). Retrying...",
+                self.table_name,
+            )
+            try:
+                self._collection.create()
+            except Exception as e:
+                _logger.critical(
+                    "Collection %s lost after clear(): %s", self.table_name, e
+                )
+                raise
 
     # ------------------------------------------------------------------
     # CRUD: get_nodes
@@ -596,7 +641,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                     all_embeddings,
                     similarity_top_k=similarity_top_k,
                 )
-                nodes = [all_nodes[i] for i in indices]
+                nodes = [all_nodes[int(i)] for i in indices]
                 return VectorStoreQueryResult(
                     nodes=nodes,
                     similarities=[1.0] * len(nodes),
@@ -637,6 +682,29 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             nodes.append(node)
             similarities.append(1.0 - float(distance) if distance else 1.0)
             ids.append(node.node_id)
+
+        # Apply Python-side metadata filtering after search
+        if query.filters:
+            # Build rows from search results for filter matching
+            rows = [
+                {
+                    FIELD_NODE_ID: n.node_id,
+                    FIELD_METADATA: n.metadata,
+                }
+                for n in nodes
+            ]
+            matched_rows = _apply_python_filter(rows, query.filters)
+            matched_ids = {r[FIELD_NODE_ID] for r in matched_rows}
+            filtered = [
+                (n, s, i)
+                for n, s, i in zip(nodes, similarities, ids)
+                if i in matched_ids
+            ]
+            if filtered:
+                nodes, similarities, ids = zip(*filtered)
+                nodes, similarities, ids = list(nodes), list(similarities), list(ids)
+            else:
+                nodes, similarities, ids = [], [], []
 
         return VectorStoreQueryResult(
             nodes=nodes,

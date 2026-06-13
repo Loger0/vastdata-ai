@@ -276,18 +276,193 @@ class TestVastbaseVectorStoreUnit:
         )
         assert store.uri == "testhost:9999/testdb"
         assert store.user == "testuser"
-        assert store.password == "testpass"
+        # password is stored as PrivateAttr to prevent leaks
+        assert store._password == "testpass"
         assert store.table_name == "my_table"
         assert store.embed_dim == 512
 
+    # ---------- query ----------
 
-# ---------------------------------------------------------------------------
-# Integration tests (require Vastbase connection)
-# ---------------------------------------------------------------------------
+    def test_query_default_vector_search(self, vs, mock_collection):
+        """query() in DEFAULT mode returns vector search results with similarities."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
 
-@pytest.mark.integration
-class TestVastbaseVectorStoreIntegration:
-    """Integration tests against a live Vastbase instance."""
+        # Mock search returns SearchResult with hits that have .data, .distance, .id
+        mock_hit = MagicMock()
+        mock_hit.id = "node-1"
+        mock_hit.distance = 0.15
+        mock_hit.data = {
+            "node_id": "node-1",
+            "text": "hello world",
+            "metadata_": {"source": "test"},
+            "embedding": [0.1] * 8,
+        }
+        mock_search_result = [[mock_hit]]
+        mock_collection.search.return_value = mock_search_result
+
+        query = VectorStoreQuery(
+            query_embedding=[0.1] * 8,
+            similarity_top_k=5,
+            mode=VectorStoreQueryMode.DEFAULT,
+        )
+        result = vs.query(query)
+
+        assert len(result.nodes) == 1
+        assert result.nodes[0].node_id == "node-1"
+        assert result.similarities == [0.85]  # 1.0 - 0.15
+        assert result.ids == ["node-1"]
+        mock_collection.search.assert_called_once()
+
+    def test_query_default_no_embedding(self, vs, mock_collection):
+        """query() without query_embedding returns empty result."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
+
+        query = VectorStoreQuery(
+            query_embedding=None,
+            similarity_top_k=5,
+            mode=VectorStoreQueryMode.DEFAULT,
+        )
+        result = vs.query(query)
+        assert result.nodes == []
+        assert result.similarities == []
+        assert result.ids == []
+
+    def test_query_text_search(self, vs, mock_collection):
+        """query() in TEXT_SEARCH mode filters by text content."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
+
+        mock_collection.query.return_value = [
+            {
+                "node_id": "id-a",
+                "text": "Python is great",
+                "metadata_": {},
+                "embedding": [0.1] * 8,
+            },
+            {
+                "node_id": "id-b",
+                "text": "Java is verbose",
+                "metadata_": {},
+                "embedding": [0.2] * 8,
+            },
+        ]
+
+        query = VectorStoreQuery(
+            query_str="python",
+            similarity_top_k=5,
+            mode=VectorStoreQueryMode.TEXT_SEARCH,
+        )
+        result = vs.query(query)
+
+        assert len(result.nodes) == 1
+        assert result.nodes[0].node_id == "id-a"
+
+    def test_query_text_search_no_query_str(self, vs, mock_collection):
+        """query() in TEXT_SEARCH mode without query_str falls through to vector search."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
+
+        mock_hit = MagicMock()
+        mock_hit.id = "node-1"
+        mock_hit.distance = 0.1
+        mock_hit.data = {
+            "node_id": "node-1",
+            "text": "hello",
+            "metadata_": {},
+            "embedding": [0.1] * 8,
+        }
+        mock_collection.search.return_value = [[mock_hit]]
+
+        query = VectorStoreQuery(
+            query_embedding=[0.1] * 8,
+            query_str="",
+            similarity_top_k=5,
+            mode=VectorStoreQueryMode.TEXT_SEARCH,
+        )
+        result = vs.query(query)
+        assert len(result.nodes) == 1
+
+    def test_query_mmr_mode_overfetches(self, vs, mock_collection):
+        """query() in MMR mode over-fetches (4x top_k) for diversity re-ranking."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
+
+        # Create 4 mock hits with different embeddings for MMR diversity
+        hits = []
+        for i in range(4):
+            hit = MagicMock()
+            hit.id = f"node-{i}"
+            hit.distance = 0.1 + i * 0.05
+            emb = [0.1 * (i + 1)] * 8
+            hit.data = {
+                "node_id": f"node-{i}",
+                "text": f"doc {i}",
+                "metadata_": {},
+                "embedding": emb,
+            }
+            hits.append(hit)
+        mock_collection.search.return_value = [hits]
+
+        query = VectorStoreQuery(
+            query_embedding=[0.15] * 8,
+            similarity_top_k=2,
+            mode=VectorStoreQueryMode.MMR,
+        )
+        result = vs.query(query)
+
+        # Should return similarity_top_k nodes after MMR re-ranking
+        assert len(result.nodes) == 2
+        assert len(result.ids) == 2
+        # Verify over-fetch: search called with limit = 2 * 4 = 8
+        call_kwargs = mock_collection.search.call_args[1]
+        assert call_kwargs["limit"] == 8
+
+    def test_query_with_filters(self, vs, mock_collection):
+        """query() applies metadata filters in Python after vector search."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+            MetadataFilters,
+            MetadataFilter,
+            FilterOperator,
+        )
+
+        mock_hit = MagicMock()
+        mock_hit.id = "node-1"
+        mock_hit.distance = 0.1
+        mock_hit.data = {
+            "node_id": "node-1",
+            "text": "filtered result",
+            "metadata_": {"source": "wiki"},
+            "embedding": [0.1] * 8,
+        }
+        mock_collection.search.return_value = [[mock_hit]]
+
+        filters = MetadataFilters(
+            filters=[MetadataFilter(key="source", value="wiki", operator=FilterOperator.EQ)]
+        )
+        query = VectorStoreQuery(
+            query_embedding=[0.1] * 8,
+            similarity_top_k=5,
+            mode=VectorStoreQueryMode.DEFAULT,
+            filters=filters,
+        )
+        result = vs.query(query)
+
+        assert len(result.nodes) == 1
+        assert result.nodes[0].node_id == "node-1"
 
     def test_initialize_creates_collection(self, vector_store):
         """_initialize() should create a collection in Vastbase."""
