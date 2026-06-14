@@ -32,6 +32,10 @@ _logger = logging.getLogger(__name__)
 # same type names are valid.
 PGType = str  # simplified — see PGVectorStore for the full Literal
 
+# ── Constants (PGVectorStore compat) ────────────────────────────────────
+DEFAULT_MMR_PREFETCH_FACTOR = 2
+DBEmbeddingRow = Dict[str, Any]
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # VastbaseVectorStore
@@ -635,6 +639,8 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         Returns:
             List of ``TextNode`` objects built from the result rows.
         """
+        import json as _json
+
         nodes: List[TextNode] = []
         for row in results:
             # Support both dict-style and object-style result rows
@@ -650,6 +656,20 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                 embedding = getattr(row, "embedding", None)
                 metadata = getattr(row, "metadata_", {}) or {}
                 ref_doc_id = getattr(row, "ref_doc_id", None)
+
+            # ADAPT: pyvastbase returns embeddings as string representations
+            # (e.g. "[0.1,0.2,0.3,0.4]") and metadata as JSON strings.
+            # Normalise both to their Python types.
+            if isinstance(embedding, str) and embedding:
+                try:
+                    embedding = _json.loads(embedding)
+                except (_json.JSONDecodeError, TypeError):
+                    embedding = None
+            if isinstance(metadata, str) and metadata:
+                try:
+                    metadata = _json.loads(metadata)
+                except (_json.JSONDecodeError, TypeError):
+                    metadata = {}
 
             node = TextNode(
                 id_=node_id,
@@ -816,3 +836,70 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         raise NotImplementedError(
             "query() will be implemented in the next phase"
         )
+
+    # ── Stub methods for framework test compatibility ───────────────────
+    # These are implemented in later issues (VAS-33, VAS-34).
+
+    async def async_add(
+        self, nodes: Sequence[BaseNode], **kwargs: Any
+    ) -> List[str]:
+        raise NotImplementedError("async_add — next phase")
+
+    async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
+        raise NotImplementedError("adelete — next phase")
+
+    async def adelete_nodes(
+        self, node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+        **delete_kwargs: Any,
+    ) -> None:
+        raise NotImplementedError("adelete_nodes — next phase")
+
+    async def aget_nodes(
+        self, node_ids: Optional[List[str]] = None,
+    ) -> List[BaseNode]:
+        raise NotImplementedError("aget_nodes — next phase")
+
+    async def aclear(self) -> None:
+        raise NotImplementedError("aclear — next phase")
+
+    async def aquery(
+        self, query: VectorStoreQuery, **kwargs: Any
+    ) -> VectorStoreQueryResult:
+        raise NotImplementedError("aquery — next phase")
+
+    def _build_query(
+        self, query: VectorStoreQuery
+    ) -> VectorStoreQueryResult:
+        raise NotImplementedError("_build_query — next phase")
+
+    def _build_sparse_query(
+        self, query: VectorStoreQuery
+    ) -> VectorStoreQueryResult:
+        raise NotImplementedError("_build_sparse_query — next phase")
+
+    def _hybrid_query(
+        self, query: VectorStoreQuery
+    ) -> VectorStoreQueryResult:
+        raise NotImplementedError("_hybrid_query — next phase")
+
+    async def _async_hybrid_query(
+        self, query: VectorStoreQuery
+    ) -> VectorStoreQueryResult:
+        raise NotImplementedError("_async_hybrid_query — next phase")
+
+    def _mmr_query(
+        self, query: VectorStoreQuery, **kwargs: Any
+    ) -> VectorStoreQueryResult:
+        raise NotImplementedError("_mmr_query — next phase")
+
+    def _prepare_mmr_query(
+        self, query: VectorStoreQuery, **kwargs: Any
+    ) -> Any:
+        raise NotImplementedError("_prepare_mmr_query — next phase")
+
+    @staticmethod
+    def _get_query_session_settings(
+        query: VectorStoreQuery,
+    ) -> List[str]:
+        return []

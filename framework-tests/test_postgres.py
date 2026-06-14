@@ -502,7 +502,7 @@ def second_table(db):
     engine.dispose()
 
 @pytest.fixture()
-def pg_custom_query(db: None, second_table: Table) -> Any:
+def pg_custom_query(db: None, second_table: Any) -> Any:
     def customize_query(query: Select, table_class: Any, **kwargs: Any) -> Select:
         return query.add_columns(second_table.c.field1).join(
             second_table, second_table.c.id == table_class.node_id
