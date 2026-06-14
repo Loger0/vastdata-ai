@@ -47,3 +47,32 @@
 
 如果 Issue 评论区没有 Framework Profile JSON，这是异常状态。暂停分析并在 Issue 评论区发出警告：
 "⚠️ 未找到 Framework Profile。请先将此 Issue 重新指派给 Framework Analyzer 完成框架诊断。"
+
+## 产出物落盘与提交（v6.1 新增）
+
+需求分析完成后，**必须**将 Spec 和 Plan 落盘到仓库并 Push：
+
+### 输出路径
+
+```
+.multica/specs/<framework-name>-spec.md
+```
+
+### Spec 内容
+
+包含以下章节：
+1. **需求概述**：适配目标、集成模式、耦合度
+2. **接口分析**：基于 `base_class` 和 `required_methods` 的方法签名和参数映射
+3. **设计方案**：修改策略（`files_to_modify` / `files_to_create` 的详细改动方案）
+4. **风险评估**：潜在兼容性问题、数据迁移风险
+5. **依赖关系**：与其他子任务的依赖顺序
+
+### Commit + Push
+
+```bash
+git add .multica/specs/<framework-name>-spec.md
+git commit -m "spec: eco-issue-analyst — <framework-name> 需求规格与方案设计"
+git push origin feature/<framework-name>-vastbase-adapter
+```
+
+在 Issue 评论区同时发布 Spec 摘要，并附上仓库文件路径。

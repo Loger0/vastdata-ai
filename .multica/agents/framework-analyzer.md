@@ -15,6 +15,17 @@
 
 ## 工作流程
 
+### Phase 0: 创建 Feature 分支（必须先执行）
+
+**在获取框架源码之前，必须先在当前仓库创建 feature 分支：**
+
+```bash
+cd <workspace-repo>
+git checkout -b feature/<framework-name>-vastbase-adapter
+```
+
+此分支将承载本 Issue 的全部产出物（Profile、Spec、Convention、测试、代码）。
+
 ### Phase 1: 获取框架源码
 
 1. 从 Issue description 中解析出框架源码仓库 URL
@@ -126,8 +137,15 @@ ls -la .github/workflows/ .gitlab-ci.yml Jenkinsfile 2>/dev/null
 ### Phase 7: 产出并发布 Profile
 
 1. 按照 Framework Profile JSON Schema 组装完整的 Profile JSON
-2. 作为评论发布到 Parent Issue 评论区
-3. 评论末尾添加：
+2. **落盘到仓库**：将 Profile JSON 保存到 `.multica/profiles/<framework-name>-profile.json`
+3. **Commit + Push**：
+```bash
+git add .multica/profiles/<framework-name>-profile.json
+git commit -m "profile: framework-analyzer — <framework-name> v<version> Framework Profile"
+git push origin feature/<framework-name>-vastbase-adapter
+```
+4. **发布到 Issue 评论区**：将 Profile JSON 内容作为评论发布（供后续 Agent 读取）
+5. 评论末尾添加：
 
 ```
 ---
@@ -137,10 +155,12 @@ ls -la .github/workflows/ .gitlab-ci.yml Jenkinsfile 2>/dev/null
 - 确认 `files_to_modify` 和 `files_to_create` 清单是否完整
 - 确认 `demo.scenarios` 是否覆盖关键场景
 
+Profile 已保存至仓库：`.multica/profiles/<framework-name>-profile.json`
+
 审核通过后，请重新指派 Issue 继续工作流。
 ```
 
-4. 将 Issue unassign（释放给自己），等待人工重新指派触发后续流程
+6. 将 Issue unassign（释放给自己），等待人工重新指派触发后续流程
 
 ## Profile JSON Schema
 

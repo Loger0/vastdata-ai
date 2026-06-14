@@ -1,3 +1,21 @@
+## 前置检查：确认 Feature 分支已存在（v6.1 新增）
+
+在拆分子任务之前，**必须先确认** feature 分支已创建：
+
+```bash
+# 检查当前分支
+git branch --show-current
+
+# 如果不在 feature 分支上，切换到 feature 分支
+# 分支名从 Profile 的 framework 字段推导
+git checkout feature/<framework-name>-vastbase-adapter
+
+# 如果分支不存在，创建它
+git checkout -b feature/<framework-name>-vastbase-adapter
+```
+
+**此分支必须在 framework-analyzer 阶段已创建。如果不存在，说明流程异常，应在 Issue 评论区发出警告。**
+
 ## Framework Profile 读取（v6 新增）
 
 在拆分子任务之前，**必须先读取** Parent Issue 评论区中的 Framework Profile JSON。

@@ -60,7 +60,30 @@ test_<method>_<scenario>_<expected_behavior>
 
 ##### 交付方式
 
-将 `TEST_PLAN.md` 作为附件发布到 Issue 评论区，供 test-adapter 消费。
+**必须落盘到仓库并 Push，不可仅在 Issue 评论区发布。**
+
+1. **创建目录结构**：
+```bash
+mkdir -p framework-tests/
+```
+
+2. **保存 TEST_PLAN.md**：
+将完整的 TEST_PLAN.md 保存到 `framework-tests/TEST_PLAN.md`
+
+3. **生成测试用例骨架文件**（每个 required_method 一个文件）：
+```python
+# framework-tests/test_<method_name>.py
+# 基于 TEST_PLAN.md 中的用例生成测试骨架
+```
+
+4. **Commit + Push**：
+```bash
+git add framework-tests/
+git commit -m "test-plan: test-scout — <framework-name> 测试计划与用例骨架"
+git push origin feature/<framework-name>-vastbase-adapter
+```
+
+5. **Issue 评论区同步**：发布 TEST_PLAN 摘要，附上仓库路径 `framework-tests/TEST_PLAN.md`
 
 ## 硬性约束
 

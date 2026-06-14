@@ -28,3 +28,52 @@
 #### plugin 模式
 
 分析插件规范文件中的编码约定（如 setup.py entry_point 格式、插件元数据格式）。
+
+## 产出物落盘与提交（v6.1 新增）
+
+编码规范提取完成后，**必须**将 Convention Spec 落盘到仓库并 Push：
+
+### 输出路径
+
+```
+.multica/conventions/<framework-name>-conventions.yaml
+```
+
+### YAML 格式
+
+```yaml
+framework: <framework-name>
+version: <framework-version>
+integration_mode: standalone | native | plugin
+extracted_from: <convention_references>
+conventions:
+  naming:
+    class_pattern: <pattern>
+    method_pattern: <pattern>
+    variable_pattern: <pattern>
+  imports:
+    order: [standard, third_party, local]
+    style: relative | absolute
+  typing:
+    use_type_hints: true | false
+    annotation_style: inline | stub
+  docstrings:
+    format: google | numpy | sphinx | custom
+    required_sections: [<list>]
+  error_handling:
+    exception_pattern: <pattern>
+    logging_style: <pattern>
+  registration:
+    pattern: <description>
+    entry_files: [<list>]
+```
+
+### Commit + Push
+
+```bash
+git add .multica/conventions/<framework-name>-conventions.yaml
+git commit -m "convention: convention-extractor — <framework-name> 编码规范"
+git push origin feature/<framework-name>-vastbase-adapter
+```
+
+在 Issue 评论区同时发布 Convention Spec 摘要，并附上仓库文件路径。

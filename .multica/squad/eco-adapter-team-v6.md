@@ -55,6 +55,54 @@ Child Issues（并行或串行，按拆分策略）
 | bug-fixer | a0f924f2-742d-4de8-b9c0-fd7dbc626c1f | 按需 |
 | board-watchdog | ab7e6e9a-72ba-40a9-955b-56f45cdd2afb | 持续 |
 
+### Branch & Repository Strategy（v6.1 新增）
+
+**核心原则：所有 Agent 产出物必须落盘到 Git 仓库并 Push 到远程。不可仅在本地保存或仅发布 Issue 评论。**
+
+#### 分支创建规则
+
+- 阶段 0（framework-analyzer）启动时，**必须先创建 feature 分支**
+- 分支命名：`feature/<framework-name>-vastbase-adapter`
+- 所有后续阶段（A1-A4、子 Issue 开发、集成验收）共用同一 feature 分支
+- Bug 修复使用 `fix/<descriptive-name>`，完成后合并回 feature 分支
+
+```bash
+git checkout -b feature/<framework-name>-vastbase-adapter
+```
+
+#### 各 Agent 产出物落盘路径
+
+| Agent | 产出物 | 落盘路径 |
+|-------|--------|---------|
+| framework-analyzer | Framework Profile JSON | `.multica/profiles/<framework>-profile.json` |
+| eco-issue-analyst | 需求规格 + 方案设计 | `.multica/specs/<framework>-spec.md` |
+| convention-extractor | Convention Spec YAML | `.multica/conventions/<framework>-conventions.yaml` |
+| test-scout | TEST_PLAN.md | `framework-tests/TEST_PLAN.md` |
+| test-scout | 测试用例骨架 | `framework-tests/test_<method>.py` |
+| adapter-dev | 适配代码 | 按 `files_to_modify` / `files_to_create` |
+| test-adapter | Demo 脚本 | `framework-tests/demo/` |
+| test-adapter | 集成测试 | `framework-tests/integration/` |
+
+#### Commit + Push 规则
+
+每个 Agent 完成工作后，**必须执行**：
+
+```bash
+git add <产出物路径>
+git commit -m "<type>: <agent-name> — <简短描述>"
+git push origin feature/<framework-name>-vastbase-adapter
+```
+
+- `type`: `profile` / `spec` / `convention` / `test-plan` / `feat` / `test` / `fix`
+- Issue 评论中**同时**附上产出物摘要 + 仓库文件链接
+- 不可仅发布 Issue 评论而不 commit
+
+#### .gitignore 例外
+
+以下目录**不可**加入 .gitignore：
+- `.multica/` — Agent 产出物目录
+- `framework-tests/` — 测试计划与测试用例
+
 ### 硬性门禁
 
 | Gate | 检查内容 | 阶段 |
