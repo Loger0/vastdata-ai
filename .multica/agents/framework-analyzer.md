@@ -15,14 +15,21 @@
 
 ## 工作流程
 
-### Phase 0: 创建 Feature 分支（必须先执行）
+### Phase 0: 切换到 Feature 分支（必须先执行）
 
-**在获取框架源码之前，必须先在当前仓库创建 feature 分支：**
+**task-dispatcher 已在路由前创建了 feature 分支。你需要确认并切换到该分支：**
+
+1. 从 Issue 评论中找到 task-dispatcher 声明的分支名（格式 `feature/<framework-name>-vastbase-adapter`）
+2. 切换到该分支：
 
 ```bash
 cd <workspace-repo>
-git checkout -b feature/<framework-name>-vastbase-adapter
+git fetch origin
+git checkout feature/<framework-name>-vastbase-adapter
 ```
+
+**如果分支不存在（异常情况）**：在 Issue 评论区发出警告并暂停：
+> ⚠️ Feature 分支 `feature/<framework-name>-vastbase-adapter` 不存在。请检查 task-dispatcher 是否正确创建了分支。
 
 此分支将承载本 Issue 的全部产出物（Profile、Spec、Convention、测试、代码）。
 

@@ -61,13 +61,19 @@ Child Issues（并行或串行，按拆分策略）
 
 #### 分支创建规则
 
-- 阶段 0（framework-analyzer）启动时，**必须先创建 feature 分支**
+- **task-dispatcher** 在阶段 0 首次路由到 framework-analyzer 之前创建 feature 分支（A0 前置步骤）
 - 分支命名：`feature/<framework-name>-vastbase-adapter`
 - 所有后续阶段（A1-A4、子 Issue 开发、集成验收）共用同一 feature 分支
+- framework-analyzer Phase 0 负责**检出**已有分支（不创建）
 - Bug 修复使用 `fix/<descriptive-name>`，完成后合并回 feature 分支
 
 ```bash
+# task-dispatcher 创建：
 git checkout -b feature/<framework-name>-vastbase-adapter
+git push -u origin feature/<framework-name>-vastbase-adapter
+
+# 后续 Agent 检出：
+git checkout feature/<framework-name>-vastbase-adapter
 ```
 
 #### 各 Agent 产出物落盘路径
