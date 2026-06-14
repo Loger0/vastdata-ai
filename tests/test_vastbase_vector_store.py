@@ -399,6 +399,370 @@ class TestClientProperty:
             mock_vc.assert_called_once()
 
 
+# ── Constructor tests ──────────────────────────────────────────────────
+
+class TestConstructor:
+    """Constructor should accept all 19 PGVectorStore params and set defaults."""
+
+    def test_default_values(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore()
+        assert store.connection_string == ""
+        assert store.async_connection_string == ""
+        assert store.table_name == "llamaindex"
+        assert store.schema_name == "public"
+        assert store.embed_dim == 1536
+        assert store.hybrid_search is False
+        assert store.text_search_config == "english"
+        assert store.cache_ok is False
+        assert store.perform_setup is True
+        assert store.debug is False
+        assert store.use_jsonb is False
+        assert store.hnsw_kwargs is None
+        assert store.create_engine_kwargs == {}
+        assert store.initialization_fail_on_error is False
+        assert store.use_halfvec is False
+        assert store.indexed_metadata_keys is None
+        # Private attrs
+        assert store._client is None
+        assert store._is_connected is False
+        assert store._customize_query_fn is None
+
+    def test_custom_values(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://user:pass@host:5432/db",
+            async_connection_string="postgresql://user:pass@host:5432/db",
+            table_name="my_table",
+            schema_name="myschema",
+            hybrid_search=True,
+            text_search_config="simple",
+            embed_dim=768,
+            cache_ok=True,
+            perform_setup=False,
+            debug=True,
+            use_jsonb=True,
+            hnsw_kwargs={"hnsw_m": 16},
+            create_engine_kwargs={"pool_size": 5},
+            initialization_fail_on_error=True,
+            use_halfvec=True,
+            indexed_metadata_keys=[("key1", "text")],
+        )
+        assert store.connection_string == "postgresql://user:pass@host:5432/db"
+        assert store.table_name == "my_table"
+        assert store.schema_name == "myschema"
+        assert store.embed_dim == 768
+        assert store.hybrid_search is True
+        assert store.text_search_config == "simple"
+        assert store.perform_setup is False
+        assert store.debug is True
+        assert store.use_halfvec is True
+        assert store.hnsw_kwargs == {"hnsw_m": 16}
+
+    def test_hybrid_search_requires_text_search_config(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        with pytest.raises(ValueError, match="text search configuration"):
+            VastbaseVectorStore(hybrid_search=True, text_search_config=None)
+
+    def test_table_name_lowercased(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(table_name="MyTable")
+        assert store.table_name == "mytable"
+
+    def test_schema_name_lowercased(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(schema_name="MySchema")
+        assert store.schema_name == "myschema"
+
+    def test_backward_compat_connection_uri_alias(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        # connection_uri is a deprecated alias for connection_string
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db"
+        )
+        assert store.connection_string == "postgresql://localhost:5432/db"
+
+    def test_backward_compat_dimension_alias(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        # dimension is a deprecated alias for embed_dim
+        store = VastbaseVectorStore(dimension=256)
+        assert store.embed_dim == 256
+
+    def test_connection_string_takes_precedence_over_alias(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        # connection_string should take precedence over connection_uri
+        store = VastbaseVectorStore(
+            connection_string="postgresql://a:1/db",
+            connection_uri="postgresql://b:2/db",
+        )
+        assert store.connection_string == "postgresql://a:1/db"
+
+    def test_embed_dim_takes_precedence_over_alias(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        # embed_dim should take precedence over dimension
+        store = VastbaseVectorStore(embed_dim=512, dimension=256)
+        assert store.embed_dim == 512
+
+    def test_all_19_params_accepted(self):
+        """Smoke test: all PGVectorStore-compatible params should be accepted."""
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://u:p@h:5432/db",
+            async_connection_string="postgresql://u:p@h:5432/db",
+            table_name="tbl",
+            schema_name="sch",
+            hybrid_search=False,
+            text_search_config="english",
+            embed_dim=1536,
+            cache_ok=False,
+            perform_setup=True,
+            debug=False,
+            use_jsonb=False,
+            hnsw_kwargs=None,
+            create_engine_kwargs={},
+            initialization_fail_on_error=False,
+            use_halfvec=False,
+            engine=None,
+            async_engine=None,
+            indexed_metadata_keys=None,
+            customize_query_fn=None,
+        )
+        assert store is not None
+
+    def test_class_name(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        assert VastbaseVectorStore.class_name() == "VastbaseVectorStore"
+
+
+# ── Connection management tests ────────────────────────────────────────
+
+class TestConnection:
+    """_connect(), close(), from_params(), _parse_connection_string()."""
+
+    def test_connect_creates_client(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        with patch("pyvastbase.VastbaseClient") as mock_vc:
+            mock_vc.return_value = MagicMock()
+            store._connect()
+            mock_vc.assert_called_once_with(
+                uri="postgresql://localhost:5432/vastbase"
+            )
+            assert store._is_connected is True
+            assert store._client is not None
+
+    def test_connect_noop_when_already_connected(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        store._is_connected = True
+        store._client = MagicMock()
+
+        with patch("pyvastbase.VastbaseClient") as mock_vc:
+            store._connect()
+            mock_vc.assert_not_called()
+
+    def test_connect_raises_on_empty_connection_string(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore()  # connection_string defaults to ""
+        with pytest.raises(ValueError, match="connection_string is empty"):
+            store._connect()
+
+    def test_client_property_lazy_connects(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        with patch("pyvastbase.VastbaseClient") as mock_vc:
+            mock_client = MagicMock()
+            mock_vc.return_value = mock_client
+            result = store.client
+            assert result is mock_client
+            assert store._is_connected is True
+
+    def test_client_returns_existing_without_reconnect(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        mock_client = MagicMock()
+        store._client = mock_client
+        store._is_connected = True
+
+        result = store.client
+        assert result is mock_client
+
+    def test_close_disposes_client(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        mock_client = MagicMock()
+        store._client = mock_client
+        store._is_connected = True
+
+        store.close()
+        mock_client.close.assert_called_once()
+        assert store._client is None
+        assert store._is_connected is False
+
+    def test_close_noop_when_no_client(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        store._client = None
+        store._is_connected = False
+
+        # Should not raise
+        store.close()
+        assert store._client is None
+
+    def test_close_handles_client_error(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        mock_client = MagicMock()
+        mock_client.close.side_effect = RuntimeError("connection lost")
+        store._client = mock_client
+        store._is_connected = True
+
+        # Should not raise — exception is caught and logged
+        store.close()
+        assert store._client is None
+        assert store._is_connected is False
+
+    def test_from_params_builds_connection_string(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore.from_params(
+            host="db.example.com",
+            port=18000,
+            database="vastbase",
+            user="admin",
+            password="secret",
+            table_name="my_nodes",
+            embed_dim=768,
+        )
+        assert "db.example.com" in store.connection_string
+        assert "18000" in store.connection_string
+        assert "vastbase" in store.connection_string
+        assert "admin" in store.connection_string
+        assert "secret" in store.connection_string
+        assert store.table_name == "my_nodes"
+        assert store.embed_dim == 768
+
+    def test_from_params_defaults(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore.from_params()
+        assert "localhost" in store.connection_string
+        assert "5432" in store.connection_string
+        assert "vastbase" in store.connection_string
+        assert store.table_name == "llamaindex"
+        assert store.embed_dim == 1536
+
+    def test_from_params_connection_string_overrides(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore.from_params(
+            host="ignored-host",
+            connection_string="postgresql://override:5432/mydb",
+        )
+        assert store.connection_string == "postgresql://override:5432/mydb"
+
+    def test_from_params_user_only(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore.from_params(
+            user="reader",
+            host="myhost",
+            database="mydb",
+        )
+        assert "reader@" in store.connection_string
+        assert "myhost" in store.connection_string
+        assert "mydb" in store.connection_string
+        # No password — should not contain ":password"
+        assert ":reader@" not in store.connection_string.replace("reader@", "")
+        # Verify no extraneous ':'
+        assert store.connection_string.count(":@") == 0
+
+    def test_parse_connection_string_full(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        result = VastbaseVectorStore._parse_connection_string(
+            "postgresql://user:pass@host:5432/database"
+        )
+        assert result["scheme"] == "postgresql"
+        assert result["user"] == "user"
+        assert result["password"] == "pass"
+        assert result["host"] == "host"
+        assert result["port"] == "5432"
+        assert result["database"] == "database"
+
+    def test_parse_connection_string_minimal(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        result = VastbaseVectorStore._parse_connection_string(
+            "postgresql://localhost/vastbase"
+        )
+        assert result["scheme"] == "postgresql"
+        assert result["user"] is None
+        assert result["password"] is None
+        assert result["host"] == "localhost"
+        assert result["port"] is None
+        assert result["database"] == "vastbase"
+
+    def test_parse_connection_string_empty(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        result = VastbaseVectorStore._parse_connection_string("")
+        assert result["host"] is None
+        assert result["database"] is None
+
+    def test_parse_connection_string_no_port(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        result = VastbaseVectorStore._parse_connection_string(
+            "postgresql://user@host/db"
+        )
+        assert result["user"] == "user"
+        assert result["host"] == "host"
+        assert result["port"] is None
+        assert result["database"] == "db"
+
+    def test_parse_connection_string_malformed(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        # Should not raise on malformed input
+        result = VastbaseVectorStore._parse_connection_string("not-a-uri!!!!")
+        # Returns best-effort parse; host may be None or a partial match
+        assert isinstance(result, dict)
+
+
 # ── stores_text / is_embedding_query ────────────────────────────────────
 
 class TestFlags:
