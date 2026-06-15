@@ -10,8 +10,10 @@ drop-in compatibility.  Internally, pyvastbase replaces SQLAlchemy:
 ``connect()`` + ``VastbaseClient`` / ``Collection`` / ``AsyncCollection``.
 """
 
+import json
 import logging
 import re
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
@@ -26,6 +28,30 @@ from llama_index.core.vector_stores.types import (
 )
 
 _logger = logging.getLogger(__name__)
+
+# ── Input validation (module-level) ─────────────────────────────────────
+
+# ADAPT: allow only UUIDs and alphanumeric/hyphen/underscore identifiers
+# in user-supplied values that are embedded in raw SQL expr strings.
+_SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _validate_safe_id(value: str, label: str) -> None:
+    """Raise ``ValueError`` if *value* contains unsafe characters.
+
+    Args:
+        value: The identifier to validate.
+        label: Human-readable label for the error message.
+
+    Raises:
+        ValueError: If *value* fails the safe-id pattern check.
+    """
+    if not _SAFE_ID_PATTERN.match(value):
+        raise ValueError(
+            f"{label} contains unsafe characters: {value!r}. "
+            f"Only [a-zA-Z0-9_-] characters are permitted."
+        )
+
 
 # ADAPT: re-use PGVectorStore's PGType literal for indexed_metadata_keys
 # compatibility.  Vastbase/PostgreSQL supports the same type set, so the
@@ -60,6 +86,118 @@ def _map_text_search_config(config: str) -> str:
             config,
         )
     return mapped
+
+
+class _VastbaseWrapper:
+    """Thin wrapper around standalone pyvastbase functions + Collection API.
+
+    ADAPT: pyvastbase 0.2.x ``VastbaseClient`` passes ``using=`` to internal
+    utility functions that do not accept it, causing ``TypeError`` on every
+    call.  This wrapper delegates directly to the standalone functions (for
+    DDL) and ``Collection`` objects (for data operations), avoiding the
+    broken client path entirely.
+    """
+
+    # ── DDL operations (standalone functions) ──────────────────────────
+
+    def has_collection(self, collection_name: str) -> bool:
+        from pyvastbase import has_collection  # type: ignore[import-untyped]
+        return has_collection(collection_name)
+
+    def create_collection(self, collection_name: str, fields: list) -> None:
+        # ADAPT: Use Collection + CollectionSchema (not standalone
+        # create_collection) so the internal schema cache stays
+        # consistent — Collection() can then find the collection.
+        from pyvastbase import (  # type: ignore[import-untyped]
+            Collection,
+            CollectionSchema,
+            FieldSchema,
+            DataType as VBDataType,
+        )
+        # Convert the dict-style fields to FieldSchema objects
+        schema_fields = []
+        for f in fields:
+            fs = FieldSchema(
+                name=f["name"],
+                dtype=f["dtype"],
+                is_primary_key=f.get("is_primary_key", False),
+                max_length=f.get("max_length"),
+                dim=f.get("dim"),
+            )
+            schema_fields.append(fs)
+        schema = CollectionSchema(name=collection_name, fields=schema_fields)
+        col = Collection(collection_name, schema=schema)
+        col.create()
+
+    def create_index(
+        self, *, collection_name: str, field_name: str, index_params: Any
+    ) -> None:
+        from pyvastbase import Collection  # type: ignore[import-untyped]
+        col = Collection(collection_name)
+        col.create_index(field_name=field_name, index_params=index_params)
+
+    def truncate_collection(self, collection_name: str) -> None:
+        from pyvastbase import Collection  # type: ignore[import-untyped]
+        col = Collection(collection_name)
+        col.truncate()
+
+    def drop_collection(self, collection_name: str) -> None:
+        from pyvastbase import drop_collection  # type: ignore[import-untyped]
+        drop_collection(collection_name)
+
+    # ── Data operations (via Collection) ───────────────────────────────
+
+    def _col(self, collection_name: str):
+        """Get a Collection instance for the named table."""
+        from pyvastbase import Collection  # type: ignore[import-untyped]
+        return Collection(collection_name)
+
+    def insert(self, collection_name: str, data: list) -> Any:
+        return self._col(collection_name).insert(data)
+
+    def delete(self, collection_name: str, *, expr: str) -> Any:
+        return self._col(collection_name).delete(expr=expr)
+
+    def query(
+        self,
+        collection_name: str,
+        *,
+        expr: str = "",
+        limit: int = 10000,
+        output_fields: Optional[list] = None,
+        **kwargs: Any,
+    ) -> list:
+        return self._col(collection_name).query(
+            expr=expr,
+            limit=limit,
+            output_fields=output_fields or [],
+        )
+
+    def search(
+        self,
+        collection_name: str,
+        *,
+        data: list,
+        limit: int = 10,
+        output_fields: Optional[list] = None,
+        filter_expr: str = "",
+        metric_type: str = "L2",
+        **kwargs: Any,
+    ) -> list:
+        return self._col(collection_name).search(
+            data=data,
+            limit=limit,
+            output_fields=output_fields or [],
+            filter_expr=filter_expr,
+            metric_type=metric_type,
+        )
+
+    def close(self) -> None:
+        from pyvastbase import remove_connection  # type: ignore[import-untyped]
+        try:
+            remove_connection("default")
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -303,6 +441,22 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         # ADAPT: store SQLAlchemy compatibility attrs as private state
         self._customize_query_fn = customize_query_fn
 
+        # ADAPT: auto-initialize collection + HNSW/FULLTEXT indexes on
+        # construction (mirrors PGVectorStore's __init__ behavior).
+        # Skipped when perform_setup=False.
+        if self.perform_setup:
+            try:
+                self._initialize()
+            except Exception:
+                if self.initialization_fail_on_error:
+                    raise
+                _logger.warning(
+                    "Failed to auto-initialize collection '%s' — "
+                    "it will be created on first add() call instead",
+                    self.table_name,
+                    exc_info=self.debug,
+                )
+
     @staticmethod
     def _warn_unsupported_params(
         use_jsonb: bool = False,
@@ -510,14 +664,19 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     def _connect(self) -> None:
         """Establish the connection to Vastbase via pyvastbase.
 
-        ADAPT: uses ``pyvastbase.VastbaseClient`` with the connection URI.
+        ADAPT: Uses ``pyvastbase.connect()`` to register the connection,
+        then creates a ``VastbaseClient()`` without arguments to pick up
+        the default connection.  pyvastbase 0.2.x ``VastbaseClient(uri=...)``
+        is unreliable due to ``using=`` parameter mismatch in internal
+        utility calls.
+
         This replaces SQLAlchemy's ``create_engine()`` / ``create_async_engine()``
         dual-engine pattern.  pyvastbase manages connection pooling internally.
         """
         if self._is_connected:
             return
 
-        from pyvastbase import VastbaseClient  # type: ignore[import-untyped]
+        from pyvastbase import connect, VastbaseClient  # type: ignore[import-untyped]
 
         uri = self.connection_string
         if not uri:
@@ -526,7 +685,17 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                 "or use from_params() with host/port/database/user/password"
             )
 
-        self._client = VastbaseClient(uri=uri)
+        # ADAPT: parse the PG URI into components for connect()
+        conn_params = self._parse_connection_string(uri)
+
+        connect(
+            host=conn_params["host"],
+            port=conn_params["port"],
+            database=conn_params["database"],
+            user=conn_params["user"],
+            password=conn_params["password"],
+        )
+        self._client = _VastbaseWrapper()
         self._is_connected = True
 
         if self.debug:
@@ -723,11 +892,19 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             m=m,
             ef_construction=ef_construction,
         )
-        self.client.create_index(
-            collection_name=self.table_name,
-            field_name="embedding",
-            index_params=params,
-        )
+        try:
+            self.client.create_index(
+                collection_name=self.table_name,
+                field_name="embedding",
+                index_params=params,
+            )
+        except Exception:
+            # ADAPT: index may already exist — _initialize() is idempotent
+            # and may be called on an already-initialised collection.
+            _logger.debug(
+                "HNSW index on %s.embedding may already exist — skipping",
+                self.table_name,
+            )
 
     def _create_fulltext_index(self) -> None:
         """Create FULLTEXT index on the ``text`` column for hybrid search.
@@ -744,14 +921,10 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """
         from pyvastbase import IndexParams  # type: ignore[import-untyped]
 
-        # ADAPT: map PG text_search_config names to Vastbase tokenizer dictionaries
-        _TOKENIZER_MAP: Dict[str, str] = {
-            "english": "en_tokenizer",
-            "chinese": "cn_tokenizer",
-        }
-        dictionary = _TOKENIZER_MAP.get(
-            self.text_search_config, self.text_search_config
-        )
+        # ADAPT: use module-level _map_text_search_config for consistent
+        # tokenizer mapping (english→en_tokenizer, chinese→cn_tokenizer,
+        # simple→en_tokenizer, unknown→en_tokenizer with warning).
+        dictionary = _map_text_search_config(self.text_search_config)
 
         params = IndexParams.fulltext_index(
             dictionary=dictionary,
@@ -785,7 +958,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             "id": node.node_id,
             "text": node.get_content(),
             "embedding": node.embedding,
-            "metadata_": node.metadata or {},
+            "metadata_": json.dumps(node.metadata or {}),
             "ref_doc_id": node.ref_doc_id or "",
         }
 
@@ -809,7 +982,21 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         node_id: Optional[str] = row.get("id")
         text: str = row.get("text", "")
         embedding: Optional[List[float]] = row.get("embedding")
+        # ADAPT: pyvastbase returns vectors as strings (e.g. '[0.1,0.2,0.3]').
+        # Parse them back to Python lists for LlamaIndex TextNode.
+        if isinstance(embedding, str):
+            try:
+                embedding = json.loads(embedding)
+            except (json.JSONDecodeError, TypeError):
+                embedding = None
         metadata: dict = row.get("metadata_") or {}
+        # ADAPT: metadata_ is stored as JSON string for psycopg compatibility;
+        # parse it back to a dict if it's still a string.
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
         ref_doc_id: Optional[str] = row.get("ref_doc_id")
 
         node = TextNode(
@@ -877,7 +1064,13 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         Returns:
             List of node IDs that were inserted.
         """
-        self._create_collection()
+        # ADAPT: ensure collection and indexes exist before inserting.
+        # _initialize() is no-op when already initialized or perform_setup=False.
+        if self.perform_setup:
+            self._ensure_initialized()
+        else:
+            # Ensure at least the collection exists (without index creation)
+            self._create_collection()
 
         # ADAPT: use _node_to_dict helper for consistent serialisation
         data = [self._node_to_dict(node) for node in nodes]
@@ -924,15 +1117,13 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """
         if not ref_doc_id:
             raise ValueError("ref_doc_id must be a non-empty string")
-        # ADAPT: VastbaseClient.delete() uses SQL expressions directly.
-        # Escape single quotes for SQL safety.
-        # NOTE: This is a known limitation of pyvastbase's Milvus-style API.
-        # The expr parameter only accepts raw SQL strings; callers must ensure
-        # ref_doc_id values are sanitised before passing them in.
-        escaped = ref_doc_id.replace("'", "''")
+        # ADAPT: validate input before embedding in raw SQL expr string.
+        # pyvastbase's Milvus-style API accepts raw SQL expr strings only;
+        # parameterised expressions are not yet supported upstream.
+        _validate_safe_id(ref_doc_id, "ref_doc_id")
         self.client.delete(
             self.table_name,
-            expr=f"ref_doc_id = '{escaped}'",
+            expr=f"ref_doc_id = '{ref_doc_id}'",
         )
 
     async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
@@ -960,19 +1151,23 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             node_ids: List of node IDs to delete.  No-op if empty or None.
             filters: Optional metadata filters (not yet supported in
                 delete_nodes — reserved for future implementation).
+
+        Raises:
+            NotImplementedError: If *filters* is provided (not yet supported).
         """
+        if filters is not None:
+            raise NotImplementedError(
+                "Metadata filters in delete_nodes are not yet supported"
+            )
         if not node_ids:
             return
-        # ADAPT: Escape single quotes for SQL safety — same pattern as delete().
-        # NOTE: pyvastbase's Milvus-style API accepts raw SQL expr strings.
-        # Single-quote escaping is the only practical defense without parameterised
-        # expressions; future maintainers should avoid adding unescaped user input.
-        escaped_ids = ", ".join(
-            "'" + nid.replace("'", "''") + "'" for nid in node_ids
-        )
+        # ADAPT: validate each node_id before embedding in raw SQL.
+        for nid in node_ids:
+            _validate_safe_id(nid, "node_id")
+        ids_literal = ", ".join(f"'{nid}'" for nid in node_ids)
         self.client.delete(
             self.table_name,
-            expr=f"id IN ({escaped_ids})",
+            expr=f"id IN ({ids_literal})",
         )
 
     async def adelete_nodes(
@@ -1003,22 +1198,40 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """Retrieve nodes by their IDs.
 
         Args:
-            node_ids: Node IDs to retrieve.  Returns empty list if None/empty.
+            node_ids: Node IDs to retrieve.  When ``None``, returns all
+                nodes in the collection.  An empty list returns ``[]``.
             filters: Optional metadata filters (not yet supported in
                 get_nodes — reserved for future implementation).
 
         Returns:
             List of BaseNode objects reconstructed from the stored data.
+
+        Raises:
+            NotImplementedError: If *filters* is provided (not yet supported).
         """
+        if filters is not None:
+            raise NotImplementedError(
+                "Metadata filters in get_nodes are not yet supported"
+            )
+
+        # node_ids=None → retrieve all nodes
+        if node_ids is None:
+            results = self.client.query(
+                self.table_name,
+                output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
+            )
+            return self._parse_results(results)
+
         if not node_ids:
             return []
 
-        escaped_ids = ", ".join(
-            "'" + nid.replace("'", "''") + "'" for nid in node_ids
-        )
+        # ADAPT: validate each node_id before embedding in raw SQL.
+        for nid in node_ids:
+            _validate_safe_id(nid, "node_id")
+        ids_literal = ", ".join(f"'{nid}'" for nid in node_ids)
         results = self.client.query(
             self.table_name,
-            expr=f"id IN ({escaped_ids})",
+            expr=f"id IN ({ids_literal})",
             output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
         )
         return self._parse_results(results)

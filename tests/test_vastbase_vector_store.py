@@ -168,7 +168,7 @@ class TestAdd:
         assert inserted_data[0]["id"] == "n1"
         assert inserted_data[0]["text"] == "Hello world"
         assert inserted_data[0]["embedding"] == [0.1, 0.2, 0.3]
-        assert inserted_data[0]["metadata_"] == {"author": "Alice", "topic": "greeting"}
+        assert inserted_data[0]["metadata_"] == '{"author": "Alice", "topic": "greeting"}'
 
     def test_add_multiple_nodes(self, mock_client, sample_nodes):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
@@ -192,7 +192,9 @@ class TestAdd:
 
         store.add([sample_nodes[0]])
 
-        mock_client.has_collection.assert_called_once()
+        # has_collection may be called twice: once in _initialize() guard
+        # and once in _create_collection().  Just verify it was called.
+        mock_client.has_collection.assert_any_call(store.table_name)
         mock_client.create_collection.assert_called_once()
 
     def test_add_node_without_metadata(self, mock_client):
@@ -206,7 +208,7 @@ class TestAdd:
         store.add([node])
 
         inserted = mock_client.insert.call_args[0][1]
-        assert inserted[0]["metadata_"] == {}
+        assert inserted[0]["metadata_"] == "{}"
 
     def test_add_node_with_ref_doc_id(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
@@ -385,18 +387,21 @@ class TestClientProperty:
     """client property should lazily create a VastbaseClient."""
 
     def test_client_lazy_init(self):
-        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+        from llama_index.vector_stores.vastbase.base import (
+            VastbaseVectorStore,
+            _VastbaseWrapper,
+        )
 
         store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
         # _client should be None initially
         assert store._client is None
 
-        # ADAPT: VastbaseClient is imported lazily inside the client property,
-        # so we patch the upstream pyvastbase module.
-        with patch("pyvastbase.VastbaseClient") as mock_vc:
-            mock_vc.return_value = MagicMock()
+        # ADAPT: _connect() now creates a _VastbaseWrapper (not VastbaseClient).
+        # Patch _connect so we don't hit a real database.
+        with patch.object(store, "_connect") as mock_connect:
+            mock_connect.side_effect = lambda: setattr(store, "_client", MagicMock())
             _ = store.client
-            mock_vc.assert_called_once()
+            mock_connect.assert_called_once()
 
 
 # ── Constructor tests ──────────────────────────────────────────────────
@@ -556,14 +561,19 @@ class TestConnection:
         store = VastbaseVectorStore(
             connection_string="postgresql://localhost:5432/vastbase"
         )
-        with patch("pyvastbase.VastbaseClient") as mock_vc:
-            mock_vc.return_value = MagicMock()
+        # ADAPT: _connect() now uses pyvastbase.connect() + _VastbaseWrapper
+        with (
+            patch("pyvastbase.connect") as mock_connect,
+            patch(
+                "llama_index.vector_stores.vastbase.base._VastbaseWrapper"
+            ) as mock_wrapper_cls,
+        ):
+            mock_wrapper = MagicMock()
+            mock_wrapper_cls.return_value = mock_wrapper
             store._connect()
-            mock_vc.assert_called_once_with(
-                uri="postgresql://localhost:5432/vastbase"
-            )
+            mock_connect.assert_called_once()
             assert store._is_connected is True
-            assert store._client is not None
+            assert store._client is mock_wrapper
 
     def test_connect_noop_when_already_connected(self):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
@@ -574,9 +584,10 @@ class TestConnection:
         store._is_connected = True
         store._client = MagicMock()
 
-        with patch("pyvastbase.VastbaseClient") as mock_vc:
+        # ADAPT: _connect() skips when _is_connected is True
+        with patch("pyvastbase.connect") as mock_connect:
             store._connect()
-            mock_vc.assert_not_called()
+            mock_connect.assert_not_called()
 
     def test_connect_raises_on_empty_connection_string(self):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
@@ -591,9 +602,12 @@ class TestConnection:
         store = VastbaseVectorStore(
             connection_string="postgresql://localhost:5432/vastbase"
         )
-        with patch("pyvastbase.VastbaseClient") as mock_vc:
+        # ADAPT: _connect() now uses pyvastbase.connect() + _VastbaseWrapper
+        with patch.object(store, "_connect") as mock_connect:
             mock_client = MagicMock()
-            mock_vc.return_value = mock_client
+            mock_connect.side_effect = lambda: setattr(
+                store, "_client", mock_client
+            ) or setattr(store, "_is_connected", True)
             result = store.client
             assert result is mock_client
             assert store._is_connected is True
@@ -804,7 +818,7 @@ class TestNodeToDict:
         assert result["id"] == "n1"
         assert result["text"] == "Hello world"
         assert result["embedding"] == [0.1, 0.2, 0.3]
-        assert result["metadata_"] == {"author": "Alice"}
+        assert result["metadata_"] == '{"author": "Alice"}'
         assert result["ref_doc_id"] == ""
 
     def test_with_ref_doc_id(self):
@@ -834,7 +848,7 @@ class TestNodeToDict:
         )
         result = store._node_to_dict(node)
 
-        assert result["metadata_"] == {}
+        assert result["metadata_"] == "{}"
 
     def test_embedding_can_be_none(self):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore

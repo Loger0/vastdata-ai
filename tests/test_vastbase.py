@@ -293,7 +293,7 @@ class TestSerialization:
         assert result["id"] == "n1"
         assert result["text"] == "Hello Vastbase"
         assert result["embedding"] == [0.1, 0.2, 0.3]
-        assert result["metadata_"] == {"author": "Alice", "topic": "greeting"}
+        assert result["metadata_"] == '{"author": "Alice", "topic": "greeting"}'
         assert result["ref_doc_id"] == "doc-1"
 
     def test_node_to_dict_without_ref_doc_id(self):
@@ -321,7 +321,7 @@ class TestSerialization:
         )
         result = store._node_to_dict(node)
 
-        assert result["metadata_"] == {}
+        assert result["metadata_"] == "{}"
 
     def test_dict_to_node_basic(self):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore

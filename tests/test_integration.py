@@ -39,21 +39,50 @@ def _build_connection_uri() -> str:
     return f"postgresql://{user}:{password}@{host}:{port}/{database}"
 
 
-def _check_vastbase_reachable(connection_uri: str) -> bool:
-    """Return True if the Vastbase instance is reachable."""
-    try:
-        from pyvastbase import VastbaseClient
+def _check_vastbase_reachable() -> bool:
+    """Return True if the Vastbase instance is reachable.
 
-        client = VastbaseClient(uri=connection_uri)
-        client.list_collections()
-        client.close()
+    ADAPT: Uses ``pyvastbase.connect()`` (not ``VastbaseClient(uri=...)``)
+    because pyvastbase 0.2.x ``VastbaseClient`` passes ``using=`` to internal
+    utility functions that do not accept it.  ``connect()`` + standalone
+    utilities work correctly.
+    """
+    host = os.environ.get("VASTBASE_HOST", "127.0.0.1")
+    port = int(os.environ.get("VASTBASE_PORT", "5432"))
+    database = os.environ.get("VASTBASE_DATABASE", "test")
+    user = os.environ.get("VASTBASE_USER", "postgres")
+    password = os.environ.get("VASTBASE_PASSWORD", "Vexdb@123")
+
+    try:
+        from pyvastbase import connect, list_collections  # type: ignore[import-untyped]
+
+        connect(
+            host=host, port=port, database=database,
+            user=user, password=password,
+        )
+        list_collections()
         return True
     except Exception:
         return False
 
 
+_VASTBASE_REACHABLE = _check_vastbase_reachable()
+
+def _build_connection_uri() -> str:
+    """Build a Vastbase connection URI from environment variables."""
+    uri = os.environ.get("VASTBASE_URI")
+    if uri:
+        return uri
+
+    host = os.environ.get("VASTBASE_HOST", "127.0.0.1")
+    port = os.environ.get("VASTBASE_PORT", "5432")
+    database = os.environ.get("VASTBASE_DATABASE", "test")
+    user = os.environ.get("VASTBASE_USER", "postgres")
+    password = os.environ.get("VASTBASE_PASSWORD", "Vexdb@123")
+    return f"postgresql://{user}:{password}@{host}:{port}/{database}"
+
+
 _CONNECTION_URI = _build_connection_uri()
-_VASTBASE_REACHABLE = _check_vastbase_reachable(_CONNECTION_URI)
 
 # Per-class skip marker — only integration tests (CRUD / Search / Async)
 # need a live Vastbase; package integrity tests run regardless.
@@ -105,9 +134,9 @@ def vastbase_store():
 
     table_name = _unique_table()
     store = VastbaseVectorStore(
-        connection_uri=_CONNECTION_URI,
+        connection_string=_CONNECTION_URI,
         table_name=table_name,
-        dimension=4,
+        embed_dim=4,
     )
     # Lazy-init the client so we can clean up
     _ = store.client

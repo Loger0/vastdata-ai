@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "llama-index-vector-stores-vastbase"
 version = "0.1.0"
 description = "LlamaIndex Vector Store integration for Vastbase (VastData vector engine)"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "pyvastbase>=0.2.0",
     "llama-index-core>=0.13.0",
