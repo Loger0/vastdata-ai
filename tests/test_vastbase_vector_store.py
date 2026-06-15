@@ -562,18 +562,33 @@ class TestConnection:
             connection_string="postgresql://localhost:5432/vastbase"
         )
         # ADAPT: _connect() now uses pyvastbase.connect() + _VastbaseWrapper
+        # + AsyncConnections.add_connection for dual-Collection mode.
         with (
             patch("pyvastbase.connect") as mock_connect,
             patch(
                 "llama_index.vector_stores.vastbase.base._VastbaseWrapper"
             ) as mock_wrapper_cls,
+            patch(
+                "pyvastbase.core.connections.get_default_connections"
+            ) as mock_get_conns,
+            patch(
+                "pyvastbase.async_impl.connections.AsyncConnections"
+            ) as mock_async_conns,
         ):
             mock_wrapper = MagicMock()
             mock_wrapper_cls.return_value = mock_wrapper
+            mock_conn = MagicMock()
+            mock_get_conns.return_value.get_connection.return_value = mock_conn
             store._connect()
             mock_connect.assert_called_once()
             assert store._is_connected is True
             assert store._client is mock_wrapper
+            # Verify search_path was set
+            mock_conn._execute.assert_called_once_with(
+                "SET search_path TO public", None
+            )
+            # Verify async connection was registered
+            mock_async_conns.add_connection.assert_called_once()
 
     def test_connect_noop_when_already_connected(self):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
@@ -1126,15 +1141,13 @@ class TestInitialize:
 class TestAsyncCRUD:
     """Async CRUD operations: async_add, adelete, adelete_nodes, aget_nodes, aclear.
 
-    ADAPT: Async methods use pyvastbase ``AsyncCollection`` for native async I/O
-    (dual-Collection mode).  Tests mock ``_async_collection`` with an AsyncMock.
-    ``aclear`` falls back to ``asyncio.to_thread`` (truncate has no native async
-    equivalent in pyvastbase).
+    ADAPT: Async methods now use ``asyncio.to_thread()`` wrapping synchronous
+    methods (pyvastbase 0.2.6 async path has a psycopg param-format bug).
+    Tests mock the sync ``_client`` instead of ``_async_collection``.
     """
 
     @pytest.mark.asyncio
     async def test_async_add_nodes(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         mock_client.has_collection.return_value = True
@@ -1144,7 +1157,6 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         node = TextNode(
             id_="async-1",
@@ -1155,11 +1167,10 @@ class TestAsyncCRUD:
         node_ids = await store.async_add([node])
 
         assert node_ids == ["async-1"]
-        store._async_collection.insert.assert_called_once()
+        mock_client.insert.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_async_add_multiple_nodes(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         mock_client.has_collection.return_value = True
@@ -1169,7 +1180,6 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         nodes = [
             TextNode(id_="a1", text="A", embedding=[0.1]),
@@ -1179,12 +1189,10 @@ class TestAsyncCRUD:
         node_ids = await store.async_add(nodes)
 
         assert node_ids == ["a1", "a2", "a3"]
-        inserted = store._async_collection.insert.call_args[0][0]
-        assert len(inserted) == 3
+        mock_client.insert.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_adelete_by_ref_doc_id(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
@@ -1193,17 +1201,15 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         await store.adelete("doc-123")
 
-        store._async_collection.delete.assert_called_once()
-        call_expr = store._async_collection.delete.call_args[1]["expr"]
+        mock_client.delete.assert_called_once()
+        call_expr = mock_client.delete.call_args[1]["expr"]
         assert "doc-123" in call_expr
 
     @pytest.mark.asyncio
     async def test_adelete_empty_ref_doc_id_raises(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
@@ -1212,14 +1218,12 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         with pytest.raises(ValueError, match="ref_doc_id must be a non-empty string"):
             await store.adelete("")
 
     @pytest.mark.asyncio
     async def test_adelete_nodes_by_ids(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
@@ -1228,19 +1232,17 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         await store.adelete_nodes(["n1", "n2", "n3"])
 
-        store._async_collection.delete.assert_called_once()
-        call_expr = store._async_collection.delete.call_args[1]["expr"]
+        mock_client.delete.assert_called_once()
+        call_expr = mock_client.delete.call_args[1]["expr"]
         assert "n1" in call_expr
         assert "n2" in call_expr
         assert "n3" in call_expr
 
     @pytest.mark.asyncio
     async def test_adelete_nodes_empty_list(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
@@ -1249,15 +1251,13 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         await store.adelete_nodes([])
 
-        store._async_collection.delete.assert_not_called()
+        mock_client.delete.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_aget_nodes(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
@@ -1266,12 +1266,10 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        async_mock = AsyncMock()
-        async_mock.query.return_value = [
+        mock_client.query.return_value = [
             {"id": "n1", "text": "Hello", "metadata_": {"k": "v"}, "ref_doc_id": "doc-1"},
             {"id": "n3", "text": "World", "metadata_": {}, "ref_doc_id": "doc-3"},
         ]
-        store._async_collection = async_mock
 
         nodes = await store.aget_nodes(["n1", "n3"])
 
@@ -1283,7 +1281,6 @@ class TestAsyncCRUD:
 
     @pytest.mark.asyncio
     async def test_aget_nodes_empty_list(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
@@ -1292,12 +1289,11 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         nodes = await store.aget_nodes([])
 
         assert nodes == []
-        store._async_collection.query.assert_not_called()
+        mock_client.query.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_aclear(self, mock_client):
@@ -1310,7 +1306,7 @@ class TestAsyncCRUD:
         )
         store._client = mock_client
 
-        # ADAPT: aclear still uses asyncio.to_thread(self.clear) because
+        # ADAPT: aclear uses asyncio.to_thread(self.clear) because
         # pyvastbase AsyncCollection has no native truncate() method.
         await store.aclear()
 

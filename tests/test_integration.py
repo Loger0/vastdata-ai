@@ -273,9 +273,15 @@ class TestSearchIntegration:
             )
 
     def test_dense_search_no_results_for_far_vector(self, vastbase_store):
-        """DENSE search returns empty when no vectors are close."""
+        """DENSE search returns low-similarity results for orthogonal vectors.
+
+        Uses a query vector pointing in the opposite direction to stored
+        embeddings so cosine similarity is near -1 / distance near 2.
+        """
         query = VectorStoreQuery(
-            query_embedding=[10.0, 10.0, 10.0, 10.0],
+            # Negative components are opposite to stored positive embeddings
+            # → very low cosine similarity / high cosine distance
+            query_embedding=[-10.0, -10.0, -10.0, -10.0],
             similarity_top_k=3,
             mode=VectorStoreQueryMode.DEFAULT,
         )
@@ -285,7 +291,7 @@ class TestSearchIntegration:
         # similarities should be very low
         if result.nodes:
             for sim in result.similarities:
-                assert sim < 0.1, f"Expected low similarity for far query: {sim}"
+                assert sim < 0.1, f"Expected low similarity for opposite-direction query: {sim}"
 
     def test_dense_search_with_metadata_filter(self, vastbase_store):
         """DENSE search with metadata filters returns only matching nodes."""

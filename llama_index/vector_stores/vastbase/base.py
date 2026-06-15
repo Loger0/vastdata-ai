@@ -195,6 +195,7 @@ class _VastbaseWrapper:
             output_fields=output_fields or [],
             filter_expr=filter_expr,
             metric_type=metric_type,
+            **kwargs,
         )
 
     def close(self) -> None:
@@ -708,6 +709,34 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             user=conn_params["user"],
             password=conn_params["password"],
         )
+
+        # ADAPT: Set search_path to 'public' so that pyvastbase's schema
+        # reflection queries (build_existence_check_sql, has_collection,
+        # etc. — all of which filter by table_schema = 'public') can find
+        # tables created by Collection.create().  Without this, tables land
+        # in the user's default schema (e.g. 'aidev') and pyvastbase cannot
+        # locate them.
+        from pyvastbase.core.connections import get_default_connections  # type: ignore[import-untyped]
+        _provider = get_default_connections()
+        _vb_conn = _provider.get_connection("default")
+        _vb_conn._execute("SET search_path TO public", None)
+
+        # ADAPT: Register async connection for dual-Collection mode.
+        # AsyncCollection uses its own AsyncConnections registry (separate
+        # from the sync Connections above).  We must add the connection
+        # config synchronously so that async methods can lazily connect.
+        from pyvastbase.async_impl.connections import (  # type: ignore[import-untyped]
+            AsyncConnections,
+        )
+        AsyncConnections.add_connection(
+            "default",
+            host=conn_params["host"],
+            port=conn_params["port"],
+            database=conn_params["database"],
+            user=conn_params["user"],
+            password=conn_params["password"],
+        )
+
         self._client = _VastbaseWrapper()
         self._async_collection = AsyncCollection(self.table_name)
         self._is_connected = True
@@ -1107,10 +1136,10 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     ) -> List[str]:
         """Async version of :meth:`add`.
 
-        ADAPT: Uses pyvastbase ``AsyncCollection.insert()`` for native async
-        I/O instead of wrapping the synchronous path with ``asyncio.to_thread``.
-        This follows the Framework Profile's dual-Collection mode design
-        (sync ``_VastbaseWrapper`` + async ``AsyncCollection``).
+        ADAPT: Wraps the synchronous ``add()`` with ``asyncio.to_thread()``
+        because pyvastbase 0.2.6's async ``_load_schema_async`` passes a
+        list to psycopg for ``%(table_name)s`` named placeholders instead
+        of a dict (unlike the sync path which passes ``{table_name: ...}``).
 
         Args:
             nodes: Sequence of LlamaIndex BaseNode objects with embeddings.
@@ -1118,19 +1147,8 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         Returns:
             List of node IDs that were inserted.
         """
-        # ADAPT: ensure collection exists (idempotent).
-        if self.perform_setup:
-            self._ensure_initialized()
-        else:
-            self._create_collection()
-
-        # Ensure connection is established (lazy)
-        if self._async_collection is None:
-            self._connect()
-
-        data = [self._node_to_dict(node) for node in nodes]
-        await self._async_collection.insert(data)
-        return [node.node_id for node in nodes]
+        import asyncio
+        return await asyncio.to_thread(self.add, nodes, **kwargs)
 
     # ── CRUD: Delete ────────────────────────────────────────────────────
 
@@ -1160,7 +1178,8 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
         """Async version of :meth:`delete`.
 
-        ADAPT: Uses pyvastbase ``AsyncCollection.delete()`` for native async I/O.
+        ADAPT: Wraps the synchronous ``delete()`` with ``asyncio.to_thread()``
+        (pyvastbase 0.2.6 async path has a psycopg param-format bug).
 
         Args:
             ref_doc_id: Source document ID whose nodes should be removed.
@@ -1168,14 +1187,8 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         Raises:
             ValueError: If ``ref_doc_id`` is empty or ``None``.
         """
-        if not ref_doc_id:
-            raise ValueError("ref_doc_id must be a non-empty string")
-        _validate_safe_id(ref_doc_id, "ref_doc_id")
-        if self._async_collection is None:
-            self._connect()
-        await self._async_collection.delete(
-            expr=f"ref_doc_id = '{ref_doc_id}'"
-        )
+        import asyncio
+        await asyncio.to_thread(self.delete, ref_doc_id, **delete_kwargs)
 
     def delete_nodes(
         self,
@@ -1216,25 +1229,16 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     ) -> None:
         """Async version of :meth:`delete_nodes`.
 
-        ADAPT: Uses pyvastbase ``AsyncCollection.delete()`` for native async I/O.
+        ADAPT: Wraps the synchronous ``delete_nodes()`` with
+        ``asyncio.to_thread()`` (pyvastbase 0.2.6 async path bug).
 
         Args:
             node_ids: List of node IDs to delete.  No-op if empty or None.
             filters: Optional metadata filters (reserved for future use).
         """
-        if filters is not None:
-            raise NotImplementedError(
-                "Metadata filters in delete_nodes are not yet supported"
-            )
-        if not node_ids:
-            return
-        for nid in node_ids:
-            _validate_safe_id(nid, "node_id")
-        ids_literal = ", ".join(f"'{nid}'" for nid in node_ids)
-        if self._async_collection is None:
-            self._connect()
-        await self._async_collection.delete(
-            expr=f"id IN ({ids_literal})"
+        import asyncio
+        await asyncio.to_thread(
+            self.delete_nodes, node_ids, filters, **delete_kwargs
         )
 
     # ── CRUD: Get ───────────────────────────────────────────────────────
@@ -1292,7 +1296,8 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     ) -> List[BaseNode]:
         """Async version of :meth:`get_nodes`.
 
-        ADAPT: Uses pyvastbase ``AsyncCollection.query()`` for native async I/O.
+        ADAPT: Wraps the synchronous ``get_nodes()`` with
+        ``asyncio.to_thread()`` (pyvastbase 0.2.6 async path bug).
 
         Args:
             node_ids: Node IDs to retrieve.  Returns empty list if None/empty.
@@ -1301,31 +1306,8 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         Returns:
             List of BaseNode objects reconstructed from the stored data.
         """
-        if filters is not None:
-            raise NotImplementedError(
-                "Metadata filters in get_nodes are not yet supported"
-            )
-        if self._async_collection is None:
-            self._connect()
-
-        if node_ids is None:
-            results = await self._async_collection.query(
-                expr="",
-                output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
-            )
-            return self._parse_results(results)
-
-        if not node_ids:
-            return []
-
-        for nid in node_ids:
-            _validate_safe_id(nid, "node_id")
-        ids_literal = ", ".join(f"'{nid}'" for nid in node_ids)
-        results = await self._async_collection.query(
-            expr=f"id IN ({ids_literal})",
-            output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
-        )
-        return self._parse_results(results)
+        import asyncio
+        return await asyncio.to_thread(self.get_nodes, node_ids, filters)
 
     # ── CRUD: Clear ─────────────────────────────────────────────────────
 
@@ -1433,18 +1415,24 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """
         embedding = query.query_embedding
         if embedding is None:
+            # ADAPT: PGVectorStore falls back to text search when DEFAULT mode
+            # has no embedding but query_str is present.
+            if query.query_str:
+                return self._build_sparse_query(query, **kwargs)
             raise ValueError(
                 "query_embedding is required for DEFAULT mode vector search"
             )
 
-        filter_expr = self._build_filter_clause(query.filters) or None
+        filter_expr = self._build_filter_clause(
+            query.filters, key_prefix="metadata_"
+        ) or None
         limit = query.similarity_top_k
 
         results = self.client.search(
             self.table_name,
             data=[embedding],
             anns_field="embedding",
-            param={"metric_type": "COSINE"},
+            param={"metric_type": "cosine"},
             limit=limit,
             expr=filter_expr,
             output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
@@ -1584,10 +1572,11 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             self.table_name,
             data=[query.query_embedding],
             anns_field="embedding",
-            param={"metric_type": "COSINE"},
+            param={"metric_type": "cosine"},
             limit=query.similarity_top_k,
-            expr=self._build_filter_clause(query.filters) or None,
-            output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
+            expr=self._build_filter_clause(
+                query.filters, key_prefix="metadata_"
+            ) or None,
         )
 
         # 2. Sparse text search
@@ -1680,13 +1669,15 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         )
 
         # Prefetch candidates via dense vector search (with embeddings)
-        filter_expr = self._build_filter_clause(query.filters) or None
+        filter_expr = self._build_filter_clause(
+            query.filters, key_prefix="metadata_"
+        ) or None
 
         results = self.client.search(
             self.table_name,
             data=[embedding],
             anns_field="embedding",
-            param={"metric_type": "COSINE"},
+            param={"metric_type": "cosine"},
             limit=prefetch_k,
             expr=filter_expr,
             output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
@@ -1896,6 +1887,20 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             embedding = row.get("embedding")
             ref_doc_id = row.get("ref_doc_id", "")
             rank = row.get("rank", 0.0)
+
+            # ADAPT: pyvastbase may return vectors / metadata as JSON strings
+            # (e.g. '[0.1,0.15,0.2,0.25]').  Parse them back to Python
+            # objects so TextNode validation passes.
+            if isinstance(embedding, str):
+                try:
+                    embedding = json.loads(embedding)
+                except (json.JSONDecodeError, TypeError):
+                    embedding = None
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
 
             node = TextNode(
                 id_=node_id,
