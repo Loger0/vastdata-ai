@@ -165,22 +165,68 @@ class TestOperatorTEXTMATCH:
 
 
 class TestOperatorCONTAINS:
-    """CONTAINS operator → value = ANY(key)."""
+    """CONTAINS operator → key @> 'value'::jsonb (JSONB containment)."""
 
     def test_contains(self):
-        # ADAPT: Vastbase supports PostgreSQL-compatible ANY(array) syntax
+        # ADAPT: JSONB containment check using @> operator
         mf = MetadataFilter(key="tags", value="ml", operator=FilterOperator.CONTAINS)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "'ml' = ANY(tags)"
+        assert "@>" in result
+        assert "tags" in result
+        assert "ml" in result
 
 
 class TestOperatorISEMPTY:
-    """IS_EMPTY operator → key IS NULL."""
+    """IS_EMPTY operator → (key IS NULL OR key = '')."""
 
     def test_is_empty(self):
         mf = MetadataFilter(key="deleted_at", value=None, operator=FilterOperator.IS_EMPTY)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "deleted_at IS NULL"
+        assert "IS NULL" in result
+        assert "= ''" in result
+        assert "deleted_at" in result
+
+
+class TestOperatorANY:
+    """ANY operator → key ?| array[...] (JSONB any-of check)."""
+
+    def test_any_strings(self):
+        # ADAPT: JSONB ?| operator checks if array contains ANY of the values
+        mf = MetadataFilter(
+            key="tags", value=["ml", "ai", "db"],
+            operator=FilterOperator.ANY,
+        )
+        result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
+        assert "?|" in result
+        assert "array" in result
+        assert "ml" in result
+        assert "ai" in result
+        assert "db" in result
+
+    def test_any_single_value(self):
+        mf = MetadataFilter(
+            key="status", value=["active"],
+            operator=FilterOperator.ANY,
+        )
+        result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
+        assert "?|" in result
+        assert "'active'" in result
+
+
+class TestOperatorALL:
+    """ALL operator → key ?& array[...] (JSONB all-of check)."""
+
+    def test_all_strings(self):
+        # ADAPT: JSONB ?& operator checks if array contains ALL of the values
+        mf = MetadataFilter(
+            key="tags", value=["a", "b"],
+            operator=FilterOperator.ALL,
+        )
+        result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
+        assert "?&" in result
+        assert "array" in result
+        assert "a" in result
+        assert "b" in result
 
 
 # ── Logical combination tests ────────────────────────────────────────
@@ -329,3 +375,132 @@ class TestTextMatchInsensitive:
         )
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
         assert result == "title ILIKE '%it''s a test%'"
+
+
+# ── Key prefix (metadata_->> JSON column) tests ──────────────────────
+
+class TestKeyPrefix:
+    """_to_vastbase_filter with key_prefix wraps keys in JSON extraction."""
+
+    def test_eq_with_metadata_prefix(self):
+        """key_prefix='metadata_' → metadata_->>'key' = value."""
+        mf = MetadataFilter(key="status", value="active", operator=FilterOperator.EQ)
+        result = _to_vastbase_filter(
+            MetadataFilters(filters=[mf]), key_prefix="metadata_"
+        )
+        assert result == "metadata_->>'status' = 'active'"
+
+    def test_in_with_metadata_prefix(self):
+        """IN with prefix uses ->> (text extraction)."""
+        mf = MetadataFilter(key="color", value=["red", "blue"], operator=FilterOperator.IN)
+        result = _to_vastbase_filter(
+            MetadataFilters(filters=[mf]), key_prefix="metadata_"
+        )
+        assert "metadata_->>'color'" in result
+        assert "IN" in result
+
+    def test_text_match_with_metadata_prefix(self):
+        """TEXT_MATCH with prefix uses ->> extraction."""
+        mf = MetadataFilter(
+            key="desc", value="vector", operator=FilterOperator.TEXT_MATCH
+        )
+        result = _to_vastbase_filter(
+            MetadataFilters(filters=[mf]), key_prefix="metadata_"
+        )
+        assert "metadata_->>'desc'" in result
+        assert "LIKE" in result
+
+    def test_contains_with_metadata_prefix(self):
+        """CONTAINS with prefix uses -> (JSONB, not text) extraction."""
+        mf = MetadataFilter(
+            key="tags", value="ml", operator=FilterOperator.CONTAINS
+        )
+        result = _to_vastbase_filter(
+            MetadataFilters(filters=[mf]), key_prefix="metadata_"
+        )
+        assert "metadata_->'tags'" in result
+        assert "@>" in result
+
+    def test_is_empty_with_metadata_prefix(self):
+        """IS_EMPTY with prefix wraps both sides."""
+        mf = MetadataFilter(
+            key="deleted_at", value=None, operator=FilterOperator.IS_EMPTY
+        )
+        result = _to_vastbase_filter(
+            MetadataFilters(filters=[mf]), key_prefix="metadata_"
+        )
+        assert "metadata_->>'deleted_at' IS NULL" in result
+        assert "= ''" in result
+
+    def test_any_with_metadata_prefix(self):
+        """ANY with prefix uses -> (JSONB) for ?| operator."""
+        mf = MetadataFilter(
+            key="tags", value=["ml", "ai"], operator=FilterOperator.ANY
+        )
+        result = _to_vastbase_filter(
+            MetadataFilters(filters=[mf]), key_prefix="metadata_"
+        )
+        assert "metadata_->'tags'" in result
+        assert "?|" in result
+
+    def test_all_with_metadata_prefix(self):
+        """ALL with prefix uses -> (JSONB) for ?& operator."""
+        mf = MetadataFilter(
+            key="required", value=["a", "b"], operator=FilterOperator.ALL
+        )
+        result = _to_vastbase_filter(
+            MetadataFilters(filters=[mf]), key_prefix="metadata_"
+        )
+        assert "metadata_->'required'" in result
+        assert "?&" in result
+
+    def test_nested_with_metadata_prefix(self):
+        """Nested AND/OR filters should all get the prefix."""
+        f1 = MetadataFilter(key="x", value=1, operator=FilterOperator.EQ)
+        f2 = MetadataFilter(key="y", value=2, operator=FilterOperator.GT)
+        result = _to_vastbase_filter(
+            MetadataFilters(filters=[f1, f2], condition=FilterCondition.AND),
+            key_prefix="metadata_",
+        )
+        assert "metadata_->>'x'" in result
+        assert "metadata_->>'y'" in result
+        assert "AND" in result
+
+
+# ── Key validation tests ───────────────────────────────────────────
+
+class TestKeyValidation:
+    """Filter key names are validated for safe characters only."""
+
+    def test_valid_key_passes(self):
+        """Alphanumeric + hyphen + underscore keys should pass."""
+        from llama_index.vector_stores.vastbase.utils import _validate_key_name
+        _validate_key_name("normal_key")
+        _validate_key_name("key-with-dashes")
+        _validate_key_name("UPPERCASE_123")
+
+    def test_key_with_spaces_raises(self):
+        """Spaces in key should raise ValueError."""
+        from llama_index.vector_stores.vastbase.utils import _validate_key_name
+        with pytest.raises(ValueError, match="unsafe characters"):
+            _validate_key_name("bad key")
+
+    def test_key_with_special_chars_raises(self):
+        """Special characters in key should raise ValueError."""
+        from llama_index.vector_stores.vastbase.utils import _validate_key_name
+        with pytest.raises(ValueError, match="unsafe characters"):
+            _validate_key_name("key;DROP TABLE")
+
+    def test_key_with_quotes_raises(self):
+        """Quote characters in key should raise ValueError."""
+        from llama_index.vector_stores.vastbase.utils import _validate_key_name
+        with pytest.raises(ValueError, match="unsafe characters"):
+            _validate_key_name("key'name")
+
+    def test_filter_with_invalid_key_raises(self):
+        """_to_vastbase_filter should validate keys and raise on unsafe chars."""
+        mf = MetadataFilter(
+            key="bad;key", value="x", operator=FilterOperator.EQ
+        )
+        with pytest.raises(ValueError, match="unsafe characters"):
+            _to_vastbase_filter(MetadataFilters(filters=[mf]))

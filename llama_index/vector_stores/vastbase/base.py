@@ -324,6 +324,9 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     # expose a SQLAlchemy Select object to customize.
     _customize_query_fn: Any = PrivateAttr(default=None)
     _is_initialized: bool = PrivateAttr(default=False)
+    # ADAPT: dual-Collection mode — sync Collection for blocking I/O,
+    # async AsyncCollection for native async operations.
+    _async_collection: Any = PrivateAttr(default=None)
 
     # ── Constructor ─────────────────────────────────────────────────────
 
@@ -677,11 +680,16 @@ class VastbaseVectorStore(BasePydanticVectorStore):
 
         This replaces SQLAlchemy's ``create_engine()`` / ``create_async_engine()``
         dual-engine pattern.  pyvastbase manages connection pooling internally.
+
+        ADAPT: Creates both a sync ``_VastbaseWrapper`` and an async
+        ``AsyncCollection`` instance (dual-Collection mode), matching the
+        Framework Profile design decision for native async support.
         """
         if self._is_connected:
             return
 
         from pyvastbase import connect  # type: ignore[import-untyped]
+        from pyvastbase import AsyncCollection  # type: ignore[import-untyped]
 
         uri = self.connection_string
         if not uri:
@@ -701,6 +709,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             password=conn_params["password"],
         )
         self._client = _VastbaseWrapper()
+        self._async_collection = AsyncCollection(self.table_name)
         self._is_connected = True
 
         if self.debug:
@@ -724,6 +733,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                 _logger.debug("Error closing VastbaseClient", exc_info=True)
             finally:
                 self._client = None
+                self._async_collection = None
                 self._is_connected = False
 
     @staticmethod
@@ -1097,10 +1107,10 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     ) -> List[str]:
         """Async version of :meth:`add`.
 
-        ADAPT: wraps the synchronous ``add()`` via ``asyncio.to_thread()``.
-        pyvastbase does not expose async APIs on ``VastbaseClient``, so we
-        offload the blocking I/O to a thread instead of using
-        ``AsyncCollection`` (which requires a separate connection setup).
+        ADAPT: Uses pyvastbase ``AsyncCollection.insert()`` for native async
+        I/O instead of wrapping the synchronous path with ``asyncio.to_thread``.
+        This follows the Framework Profile's dual-Collection mode design
+        (sync ``_VastbaseWrapper`` + async ``AsyncCollection``).
 
         Args:
             nodes: Sequence of LlamaIndex BaseNode objects with embeddings.
@@ -1108,9 +1118,19 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         Returns:
             List of node IDs that were inserted.
         """
-        import asyncio
+        # ADAPT: ensure collection exists (idempotent).
+        if self.perform_setup:
+            self._ensure_initialized()
+        else:
+            self._create_collection()
 
-        return await asyncio.to_thread(self.add, nodes, **kwargs)
+        # Ensure connection is established (lazy)
+        if self._async_collection is None:
+            self._connect()
+
+        data = [self._node_to_dict(node) for node in nodes]
+        await self._async_collection.insert(data)
+        return [node.node_id for node in nodes]
 
     # ── CRUD: Delete ────────────────────────────────────────────────────
 
@@ -1140,15 +1160,22 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
         """Async version of :meth:`delete`.
 
+        ADAPT: Uses pyvastbase ``AsyncCollection.delete()`` for native async I/O.
+
         Args:
             ref_doc_id: Source document ID whose nodes should be removed.
 
         Raises:
             ValueError: If ``ref_doc_id`` is empty or ``None``.
         """
-        import asyncio
-
-        return await asyncio.to_thread(self.delete, ref_doc_id, **delete_kwargs)
+        if not ref_doc_id:
+            raise ValueError("ref_doc_id must be a non-empty string")
+        _validate_safe_id(ref_doc_id, "ref_doc_id")
+        if self._async_collection is None:
+            self._connect()
+        await self._async_collection.delete(
+            expr=f"ref_doc_id = '{ref_doc_id}'"
+        )
 
     def delete_nodes(
         self,
@@ -1189,14 +1216,25 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     ) -> None:
         """Async version of :meth:`delete_nodes`.
 
+        ADAPT: Uses pyvastbase ``AsyncCollection.delete()`` for native async I/O.
+
         Args:
             node_ids: List of node IDs to delete.  No-op if empty or None.
             filters: Optional metadata filters (reserved for future use).
         """
-        import asyncio
-
-        return await asyncio.to_thread(
-            self.delete_nodes, node_ids, filters, **delete_kwargs
+        if filters is not None:
+            raise NotImplementedError(
+                "Metadata filters in delete_nodes are not yet supported"
+            )
+        if not node_ids:
+            return
+        for nid in node_ids:
+            _validate_safe_id(nid, "node_id")
+        ids_literal = ", ".join(f"'{nid}'" for nid in node_ids)
+        if self._async_collection is None:
+            self._connect()
+        await self._async_collection.delete(
+            expr=f"id IN ({ids_literal})"
         )
 
     # ── CRUD: Get ───────────────────────────────────────────────────────
@@ -1254,6 +1292,8 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     ) -> List[BaseNode]:
         """Async version of :meth:`get_nodes`.
 
+        ADAPT: Uses pyvastbase ``AsyncCollection.query()`` for native async I/O.
+
         Args:
             node_ids: Node IDs to retrieve.  Returns empty list if None/empty.
             filters: Optional metadata filters (reserved for future use).
@@ -1261,9 +1301,31 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         Returns:
             List of BaseNode objects reconstructed from the stored data.
         """
-        import asyncio
+        if filters is not None:
+            raise NotImplementedError(
+                "Metadata filters in get_nodes are not yet supported"
+            )
+        if self._async_collection is None:
+            self._connect()
 
-        return await asyncio.to_thread(self.get_nodes, node_ids, filters)
+        if node_ids is None:
+            results = await self._async_collection.query(
+                expr="",
+                output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
+            )
+            return self._parse_results(results)
+
+        if not node_ids:
+            return []
+
+        for nid in node_ids:
+            _validate_safe_id(nid, "node_id")
+        ids_literal = ", ".join(f"'{nid}'" for nid in node_ids)
+        results = await self._async_collection.query(
+            expr=f"id IN ({ids_literal})",
+            output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
+        )
+        return self._parse_results(results)
 
     # ── CRUD: Clear ─────────────────────────────────────────────────────
 
@@ -1276,7 +1338,12 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         self.client.truncate_collection(self.table_name)
 
     async def aclear(self) -> None:
-        """Async version of :meth:`clear`."""
+        """Async version of :meth:`clear`.
+
+        ADAPT: Falls back to ``asyncio.to_thread`` for truncate — pyvastbase
+        ``AsyncCollection`` does not expose a native ``truncate()`` method.
+        All other async methods (add, delete, query) use native async I/O.
+        """
         import asyncio
 
         return await asyncio.to_thread(self.clear)
@@ -1284,7 +1351,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
 # ── Filter clause building ──────────────────────────────────────────────
 
     def _build_filter_clause(
-        self, filters: Optional[MetadataFilters]
+        self, filters: Optional[MetadataFilters], key_prefix: str = ""
     ) -> str:
         """Convert MetadataFilters to a SQL WHERE clause string.
 
@@ -1293,6 +1360,9 @@ class VastbaseVectorStore(BasePydanticVectorStore):
 
         Args:
             filters: Optional ``MetadataFilters`` instance.
+            key_prefix: Optional column prefix for JSON extraction
+                (e.g. ``"metadata_"`` for raw SQL paths).  When empty, keys
+                are used as-is — suitable for pyvastbase Milvus-style expr.
 
         Returns:
             SQL WHERE clause string (without leading ``WHERE``), or empty
@@ -1300,7 +1370,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """
         if filters is None:
             return ""
-        return _to_vastbase_filter(filters)
+        return _to_vastbase_filter(filters, key_prefix=key_prefix)
 
     # ── Query engine ──────────────────────────────────────────────────────
 
@@ -1417,7 +1487,17 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             )
 
         limit = query.sparse_top_k or query.similarity_top_k
-        filter_clause = self._build_filter_clause(query.filters)
+
+        # ADAPT: use key_prefix="metadata_" so filter keys are rendered
+        # as metadata_->>'key' (JSON extraction) in raw SQL.
+        filter_clause = self._build_filter_clause(
+            query.filters, key_prefix="metadata_"
+        )
+
+        # ADAPT: validate table_name and text_search_config before embedding
+        # in raw SQL to prevent SQL injection via user-supplied identifiers.
+        _validate_safe_id(self.table_name, "table_name")
+        _validate_safe_id(self.text_search_config, "text_search_config")
 
         # ADAPT: PostgreSQL full-text search uses plainto_tsquery for
         # user-friendly query parsing.  This is compatible with Vastbase's
@@ -1619,15 +1699,14 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         node_ids = []
         rows_map = {}
         for item in result_items:
-            item_data = item.data if hasattr(item, 'data') else item
-            item_id = item.id if hasattr(item, 'id') else item_data.get("id")
-            item_embedding = item_data.get("embedding", []) if isinstance(item_data, dict) else getattr(item_data, "embedding", [])
+            item_id, _, data = self._extract_result_item(item)
+            item_embedding = data.get("embedding", [])
 
             if item_embedding:
                 embeddings.append(list(item_embedding) if not isinstance(item_embedding, list) else item_embedding)
                 node_ids.append(item_id)
             # Store for later reconstruction
-            rows_map[item_id] = item
+            rows_map[item_id] = data
 
         if not embeddings or len(embeddings) < query.similarity_top_k:
             # Fallback: return results as-is if not enough valid embeddings
@@ -1654,22 +1733,8 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         ids = []
         for score, node_id in zip(mmr_similarities, mmr_ids):
             if node_id in rows_map:
-                item = rows_map[node_id]
-                item_data = item.data if hasattr(item, 'data') else item
-                text = item_data.get("text", "") if isinstance(item_data, dict) else getattr(item_data, "text", "")
-                metadata = item_data.get("metadata_", {}) if isinstance(item_data, dict) else getattr(item_data, "metadata_", {})
-                ref_doc_id = item_data.get("ref_doc_id", "") if isinstance(item_data, dict) else getattr(item_data, "ref_doc_id", "")
-
-                node = TextNode(
-                    id_=node_id,
-                    text=text,
-                    embedding=item_data.get("embedding") if isinstance(item_data, dict) else getattr(item_data, "embedding", None),
-                    metadata=metadata or {},
-                )
-                if ref_doc_id:
-                    node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                        node_id=ref_doc_id
-                    )
+                data = rows_map[node_id]
+                node = self._build_node_from_item(node_id, data)
                 nodes.append(node)
                 similarities.append(score)
                 ids.append(node_id)
@@ -1681,6 +1746,68 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         )
 
     # ── Result conversion helpers ─────────────────────────────────────────
+
+    @staticmethod
+    def _extract_result_item(item: Any) -> Tuple[Optional[str], float, Dict[str, Any]]:
+        """Extract id, distance, and data dict from a single result item.
+
+        Handles both pyvastbase ``SearchResultItem`` objects (with ``.id``,
+        ``.distance``, ``.data`` attributes) and plain dicts.
+
+        Args:
+            item: A single result item from a search/query result list.
+
+        Returns:
+            Tuple of ``(item_id, distance, data_dict)``.  *item_id* may be
+            ``None`` if the item has no identifiable id field.  *distance*
+            defaults to ``0.0``.  *data_dict* defaults to an empty dict.
+        """
+        if hasattr(item, 'data'):
+            return (
+                item.id,
+                float(item.distance) if item.distance else 0.0,
+                item.data if isinstance(item.data, dict) else {},
+            )
+        elif isinstance(item, dict):
+            return (
+                item.get("id"),
+                float(item.get("distance", 0)),
+                item,
+            )
+        else:
+            return (
+                getattr(item, "id", None),
+                float(getattr(item, "distance", 0.0)),
+                getattr(item, "data", {}) or {},
+            )
+
+    @staticmethod
+    def _build_node_from_item(
+        item_id: Optional[str],
+        data: Dict[str, Any],
+    ) -> TextNode:
+        """Build a ``TextNode`` from extracted result item data.
+
+        Args:
+            item_id: The node id.
+            data: Dict with keys ``text``, ``metadata_``, ``embedding``,
+                ``ref_doc_id``.
+
+        Returns:
+            ``TextNode`` populated from the data.
+        """
+        node = TextNode(
+            id_=item_id,
+            text=data.get("text", ""),
+            embedding=data.get("embedding"),
+            metadata=data.get("metadata_", {}) or {},
+        )
+        ref_doc_id = data.get("ref_doc_id", "")
+        if ref_doc_id:
+            node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                node_id=ref_doc_id
+            )
+        return node
 
     def _search_results_to_query_result(
         self,
@@ -1707,38 +1834,12 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             result_items = results or []
 
         for item in result_items:
-            # SearchResultItem has .id, .distance, .data (dict)
-            if hasattr(item, 'data'):
-                item_data = item.data
-                item_id = item.id
-                item_distance = item.distance
-            elif isinstance(item, dict):
-                item_data = item
-                item_id = item.get("id")
-                item_distance = item.get("distance", 0)
-            else:
-                item_data = {}
-                item_id = getattr(item, "id", None)
-                item_distance = getattr(item, "distance", 0)
-
-            text = item_data.get("text", "") if isinstance(item_data, dict) else getattr(item_data, "text", "")
-            metadata = item_data.get("metadata_", {}) if isinstance(item_data, dict) else getattr(item_data, "metadata_", {})
-            embedding = item_data.get("embedding") if isinstance(item_data, dict) else getattr(item_data, "embedding", None)
-            ref_doc_id = item_data.get("ref_doc_id", "") if isinstance(item_data, dict) else getattr(item_data, "ref_doc_id", "")
+            item_id, distance, data = self._extract_result_item(item)
 
             # ADAPT: cosine distance → similarity: similarity = 1 - distance
-            similarity = 1.0 - item_distance
+            similarity = 1.0 - distance
 
-            node = TextNode(
-                id_=item_id,
-                text=text,
-                embedding=embedding,
-                metadata=metadata or {},
-            )
-            if ref_doc_id:
-                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                    node_id=ref_doc_id
-                )
+            node = self._build_node_from_item(item_id, data)
 
             nodes.append(node)
             similarities.append(similarity)
@@ -1821,35 +1922,9 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             items = results or []
 
         for rank, item in enumerate(items):
-            if hasattr(item, 'data'):
-                item_data = item.data
-                item_id = item.id
-                item_distance = item.distance
-            elif isinstance(item, dict):
-                item_data = item
-                item_id = item.get("id")
-                item_distance = item.get("distance", 0)
-            else:
-                continue
-
-            text = item_data.get("text", "") if isinstance(item_data, dict) else getattr(item_data, "text", "")
-            metadata = item_data.get("metadata_", {}) if isinstance(item_data, dict) else getattr(item_data, "metadata_", {})
-            embedding = item_data.get("embedding") if isinstance(item_data, dict) else getattr(item_data, "embedding", None)
-            ref_doc_id = item_data.get("ref_doc_id", "") if isinstance(item_data, dict) else getattr(item_data, "ref_doc_id", "")
-
-            similarity = (1.0 - item_distance) if is_dense else item_distance
-
-            node = TextNode(
-                id_=item_id,
-                text=text,
-                embedding=embedding,
-                metadata=metadata or {},
-            )
-            if ref_doc_id:
-                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                    node_id=ref_doc_id
-                )
-
+            item_id, distance, data = VastbaseVectorStore._extract_result_item(item)
+            similarity = (1.0 - distance) if is_dense else distance
+            node = VastbaseVectorStore._build_node_from_item(item_id, data)
             rows.append({
                 "node_id": item_id,
                 "similarity": similarity,
