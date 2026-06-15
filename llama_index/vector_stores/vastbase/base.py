@@ -676,7 +676,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         if self._is_connected:
             return
 
-        from pyvastbase import connect, VastbaseClient  # type: ignore[import-untyped]
+        from pyvastbase import connect  # type: ignore[import-untyped]
 
         uri = self.connection_string
         if not uri:
@@ -898,13 +898,19 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                 field_name="embedding",
                 index_params=params,
             )
-        except Exception:
+        except Exception as exc:
             # ADAPT: index may already exist — _initialize() is idempotent
             # and may be called on an already-initialised collection.
-            _logger.debug(
-                "HNSW index on %s.embedding may already exist — skipping",
-                self.table_name,
-            )
+            # Only suppress "already exists"-type errors; re-raise real
+            # errors (connection failure, permission denied, etc.).
+            msg = str(exc).lower()
+            if "already exists" in msg or "duplicate" in msg:
+                _logger.debug(
+                    "HNSW index on %s.embedding already exists — skipping",
+                    self.table_name,
+                )
+            else:
+                raise
 
     def _create_fulltext_index(self) -> None:
         """Create FULLTEXT index on the ``text`` column for hybrid search.
