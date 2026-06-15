@@ -151,6 +151,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     # ADAPT: customize_query_fn is accepted but unused — pyvastbase does not
     # expose a SQLAlchemy Select object to customize.
     _customize_query_fn: Any = PrivateAttr(default=None)
+    _is_initialized: bool = PrivateAttr(default=False)
 
     # ── Constructor ─────────────────────────────────────────────────────
 
@@ -581,7 +582,36 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             pass
         return uri
 
-    # ── CRUD: helpers ─────────────────────────────────────────────────────
+    # ── Initialization ────────────────────────────────────────────────────
+
+    def _initialize(self) -> None:
+        """Full initialization: create collection + HNSW index + optional FULLTEXT.
+
+        ADAPT: Replaces PGVectorStore's _initialize() which used SQLAlchemy
+        DDL (CREATE EXTENSION → CREATE SCHEMA → CREATE TABLE → CREATE INDEX).
+        Vastbase V3 uses pyvastbase's collection management and native index API.
+
+        Idempotent — safe to call multiple times.  Skipped entirely when
+        ``perform_setup=False``.
+        """
+        if not self.perform_setup:
+            return
+
+        if self._is_initialized:
+            return
+
+        # Create collection if it doesn't exist
+        if not self.client.has_collection(self.table_name):
+            self._create_collection()
+
+        # Create HNSW index on the embedding column
+        self._create_hnsw_index()
+
+        # Create FULLTEXT index if hybrid search is enabled
+        if self.hybrid_search:
+            self._create_fulltext_index()
+
+        self._is_initialized = True
 
     def _create_collection(self) -> None:
         """Create the Vastbase collection/table if it does not exist.
@@ -600,6 +630,13 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             # Vastbase maps these to native PostgreSQL types automatically.
             from pyvastbase import DataType  # type: ignore[import-untyped]
 
+            # ADAPT: use_halfvec → FLOAT16_VECTOR (half-precision) instead of
+            # FLOAT_VECTOR (full-precision).  Vastbase >=3.0.9 supports halfvector.
+            vector_dtype = (
+                DataType.FLOAT16_VECTOR if self.use_halfvec
+                else DataType.FLOAT_VECTOR
+            )
+
             self.client.create_collection(
                 self.table_name,
                 fields=[
@@ -612,7 +649,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                     {"name": "text", "dtype": DataType.TEXT},
                     {
                         "name": "embedding",
-                        "dtype": DataType.FLOAT_VECTOR,
+                        "dtype": vector_dtype,
                         "dim": self.embed_dim,
                     },
                     {"name": "metadata_", "dtype": DataType.JSON},
@@ -623,6 +660,135 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                     },
                 ],
             )
+
+    def _create_hnsw_index(self) -> None:
+        """Create HNSW (Hierarchical Navigable Small World) index on the
+        embedding column.
+
+        ADAPT: Uses pyvastbase ``IndexParams.graph_index()`` which maps to
+        Vastbase's native HNSW implementation.  PGVectorStore used raw SQL
+        ``CREATE INDEX ... USING hnsw (embedding vector_cosine_ops)
+        WITH (m=..., ef_construction=...)``.  pyvastbase abstracts this into
+        ``create_index()`` with ``IndexParams``.
+
+        The index is created with ``IF NOT EXISTS`` semantics — if an index
+        already exists on the embedding column, it is not re-created.
+        """
+        from pyvastbase import IndexParams  # type: ignore[import-untyped]
+
+        # ADAPT: extract HNSW kwargs with PGVectorStore-compatible names
+        # (hnsw_m, hnsw_ef_construction) and map to pyvastbase names (m, ef_construction).
+        hnsw_kwargs = self.hnsw_kwargs or {}
+        m = hnsw_kwargs.get("hnsw_m", 16)
+        ef_construction = hnsw_kwargs.get("hnsw_ef_construction", 64)
+
+        params = IndexParams.graph_index(
+            m=m,
+            ef_construction=ef_construction,
+        )
+        self.client.create_index(
+            collection_name=self.table_name,
+            field_name="embedding",
+            index_params=params,
+        )
+
+    def _create_fulltext_index(self) -> None:
+        """Create FULLTEXT index on the ``text`` column for hybrid search.
+
+        ADAPT: PGVectorStore used ``to_tsvector()`` / ``to_tsquery()`` with
+        PostgreSQL GIN indexes.  Vastbase uses native BM25 full-text search
+        via pyvastbase's ``IndexParams.fulltext_index()``.
+
+        The ``text_search_config`` parameter is mapped to Vastbase tokenizer
+        dictionaries:
+        - ``"english"`` → ``"en_tokenizer"``
+        - ``"chinese"`` → ``"cn_tokenizer"``
+        - any other value is passed through as-is.
+        """
+        from pyvastbase import IndexParams  # type: ignore[import-untyped]
+
+        # ADAPT: map PG text_search_config names to Vastbase tokenizer dictionaries
+        _TOKENIZER_MAP: Dict[str, str] = {
+            "english": "en_tokenizer",
+            "chinese": "cn_tokenizer",
+        }
+        dictionary = _TOKENIZER_MAP.get(
+            self.text_search_config, self.text_search_config
+        )
+
+        params = IndexParams.fulltext_index(
+            dictionary=dictionary,
+            algorithm="BM25",
+        )
+        self.client.create_index(
+            collection_name=self.table_name,
+            field_name="text",
+            index_params=params,
+        )
+
+    # ── Serialization helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _node_to_dict(node: BaseNode) -> Dict[str, Any]:
+        """Convert a LlamaIndex ``BaseNode`` to a dict for insertion.
+
+        ADAPT: replaces inline dict-building in ``add()``.  Extracted as a
+        standalone helper so both sync ``add()`` and ``async_add()`` can
+        re-use the same serialisation logic.
+
+        Args:
+            node: A LlamaIndex ``BaseNode`` with ``node_id``, ``text``,
+                ``embedding``, ``metadata``, and optional ``ref_doc_id``.
+
+        Returns:
+            Dict with keys ``id``, ``text``, ``embedding``, ``metadata_``,
+            ``ref_doc_id``.
+        """
+        return {
+            "id": node.node_id,
+            "text": node.get_content(),
+            "embedding": node.embedding,
+            "metadata_": node.metadata or {},
+            "ref_doc_id": node.ref_doc_id or "",
+        }
+
+    @staticmethod
+    def _dict_to_node(row: Dict[str, Any]) -> TextNode:
+        """Convert a single result-row dict into a LlamaIndex ``TextNode``.
+
+        ADAPT: replaces inline dict-to-TextNode logic in ``_parse_results()``.
+        Extracted as a standalone helper so both ``_parse_results()`` and
+        ``aget_nodes()`` can re-use it.
+
+        Args:
+            row: Dict with keys ``id``, ``text``, ``embedding`` (optional),
+                ``metadata_`` (optional), ``ref_doc_id`` (optional).
+
+        Returns:
+            ``TextNode`` populated from the row data.  If ``ref_doc_id`` is
+            present, a ``SOURCE`` relationship is attached so that
+            ``node.ref_doc_id`` returns the value.
+        """
+        node_id: Optional[str] = row.get("id")
+        text: str = row.get("text", "")
+        embedding: Optional[List[float]] = row.get("embedding")
+        metadata: dict = row.get("metadata_") or {}
+        ref_doc_id: Optional[str] = row.get("ref_doc_id")
+
+        node = TextNode(
+            id_=node_id,
+            text=text,
+            embedding=embedding,
+            metadata=metadata,
+        )
+        # ADAPT: ref_doc_id is stored as a separate column but LlamaIndex
+        # exposes it as a read-only property backed by source_node.
+        # Reconstruct the SOURCE relationship so node.ref_doc_id works.
+        if ref_doc_id:
+            node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                node_id=ref_doc_id
+            )
+        return node
 
     @staticmethod
     def _parse_results(results: Any) -> List[TextNode]:
@@ -639,32 +805,17 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         for row in results:
             # Support both dict-style and object-style result rows
             if isinstance(row, dict):
-                node_id: Optional[str] = row.get("id")
-                text: str = row.get("text", "")
-                embedding: Optional[List[float]] = row.get("embedding")
-                metadata: dict = row.get("metadata_", {}) or {}
-                ref_doc_id: Optional[str] = row.get("ref_doc_id")
+                nodes.append(VastbaseVectorStore._dict_to_node(row))
             else:
-                node_id = getattr(row, "id", None)
-                text = getattr(row, "text", "")
-                embedding = getattr(row, "embedding", None)
-                metadata = getattr(row, "metadata_", {}) or {}
-                ref_doc_id = getattr(row, "ref_doc_id", None)
-
-            node = TextNode(
-                id_=node_id,
-                text=text,
-                embedding=embedding,
-                metadata=metadata,
-            )
-            # ADAPT: ref_doc_id is stored as a separate column but LlamaIndex
-            # exposes it as a read-only property backed by source_node.
-            # Reconstruct the SOURCE relationship so node.ref_doc_id works.
-            if ref_doc_id:
-                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                    node_id=ref_doc_id
-                )
-            nodes.append(node)
+                # Convert object-style row to dict for _dict_to_node
+                row_dict: Dict[str, Any] = {
+                    "id": getattr(row, "id", None),
+                    "text": getattr(row, "text", ""),
+                    "embedding": getattr(row, "embedding", None),
+                    "metadata_": getattr(row, "metadata_", {}) or {},
+                    "ref_doc_id": getattr(row, "ref_doc_id", None),
+                }
+                nodes.append(VastbaseVectorStore._dict_to_node(row_dict))
         return nodes
 
     # ── CRUD: Add ───────────────────────────────────────────────────────
@@ -691,20 +842,34 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """
         self._create_collection()
 
-        data: List[dict] = []
-        for node in nodes:
-            data.append(
-                {
-                    "id": node.node_id,
-                    "text": node.get_content(),
-                    "embedding": node.embedding,
-                    "metadata_": node.metadata or {},
-                    "ref_doc_id": node.ref_doc_id or "",
-                }
-            )
-
+        # ADAPT: use _node_to_dict helper for consistent serialisation
+        data = [self._node_to_dict(node) for node in nodes]
         self.client.insert(self.table_name, data)
         return [node.node_id for node in nodes]
+
+    # ── Async CRUD: Add ─────────────────────────────────────────────────
+
+    async def async_add(
+        self,
+        nodes: Sequence[BaseNode],
+        **kwargs: Any,
+    ) -> List[str]:
+        """Async version of :meth:`add`.
+
+        ADAPT: wraps the synchronous ``add()`` via ``asyncio.to_thread()``.
+        pyvastbase does not expose async APIs on ``VastbaseClient``, so we
+        offload the blocking I/O to a thread instead of using
+        ``AsyncCollection`` (which requires a separate connection setup).
+
+        Args:
+            nodes: Sequence of LlamaIndex BaseNode objects with embeddings.
+
+        Returns:
+            List of node IDs that were inserted.
+        """
+        import asyncio
+
+        return await asyncio.to_thread(self.add, nodes, **kwargs)
 
     # ── CRUD: Delete ────────────────────────────────────────────────────
 
@@ -733,6 +898,19 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             expr=f"ref_doc_id = '{escaped}'",
         )
 
+    async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
+        """Async version of :meth:`delete`.
+
+        Args:
+            ref_doc_id: Source document ID whose nodes should be removed.
+
+        Raises:
+            ValueError: If ``ref_doc_id`` is empty or ``None``.
+        """
+        import asyncio
+
+        return await asyncio.to_thread(self.delete, ref_doc_id, **delete_kwargs)
+
     def delete_nodes(
         self,
         node_ids: Optional[List[str]] = None,
@@ -758,6 +936,24 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         self.client.delete(
             self.table_name,
             expr=f"id IN ({escaped_ids})",
+        )
+
+    async def adelete_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+        **delete_kwargs: Any,
+    ) -> None:
+        """Async version of :meth:`delete_nodes`.
+
+        Args:
+            node_ids: List of node IDs to delete.  No-op if empty or None.
+            filters: Optional metadata filters (reserved for future use).
+        """
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.delete_nodes, node_ids, filters, **delete_kwargs
         )
 
     # ── CRUD: Get ───────────────────────────────────────────────────────
@@ -790,6 +986,24 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         )
         return self._parse_results(results)
 
+    async def aget_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+    ) -> List[BaseNode]:
+        """Async version of :meth:`get_nodes`.
+
+        Args:
+            node_ids: Node IDs to retrieve.  Returns empty list if None/empty.
+            filters: Optional metadata filters (reserved for future use).
+
+        Returns:
+            List of BaseNode objects reconstructed from the stored data.
+        """
+        import asyncio
+
+        return await asyncio.to_thread(self.get_nodes, node_ids, filters)
+
     # ── CRUD: Clear ─────────────────────────────────────────────────────
 
     def clear(self) -> None:
@@ -799,6 +1013,12 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         maps to PostgreSQL ``TRUNCATE`` — fast and non-transactional.
         """
         self.client.truncate_collection(self.table_name)
+
+    async def aclear(self) -> None:
+        """Async version of :meth:`clear`."""
+        import asyncio
+
+        return await asyncio.to_thread(self.clear)
 
     # ── Query (stub — reserved for next phase) ─────────────────────────
 
