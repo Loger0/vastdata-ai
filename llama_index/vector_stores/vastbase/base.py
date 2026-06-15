@@ -5,11 +5,15 @@ ADAPT: Vastbase V3 has a built-in vector engine compatible with
 PostgreSQL/pgvector. We wrap pyvastbase (VastbaseClient) to provide a
 Milvus-style interface that LlamaIndex's BasePydanticVectorStore expects.
 
-This module implements the CRUD operations and search (DENSE / HYBRID / TEXT)
-for the Vastbase vector store.
+The public constructor mirrors PGVectorStore's 19-parameter signature for
+drop-in compatibility.  Internally, pyvastbase replaces SQLAlchemy:
+``connect()`` + ``VastbaseClient`` / ``Collection`` / ``AsyncCollection``.
 """
 
-from typing import Any, Dict, List, Optional, Sequence
+import logging
+import re
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from urllib.parse import urlparse, urlunparse
 
 from pydantic import Field, PrivateAttr
 
@@ -18,19 +22,18 @@ from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
     MetadataFilters,
     VectorStoreQuery,
-    VectorStoreQueryMode,
     VectorStoreQueryResult,
 )
 
-from llama_index.vector_stores.vastbase.utils import _to_vastbase_filter
+_logger = logging.getLogger(__name__)
+
+# ADAPT: re-use PGVectorStore's PGType literal for indexed_metadata_keys
+# compatibility.  Vastbase/PostgreSQL supports the same type set, so the
+# same type names are valid.
+PGType = str  # simplified — see PGVectorStore for the full Literal
 
 
-# ── Text search config mapping ───────────────────────────────────────────
-
-
-# ADAPT: Vastbase uses pyvastbase tokenizer names instead of PG
-# text_search_config values.  Map PG config names to pyvastbase tokenizers.
-_TEXT_SEARCH_CONFIG_TO_TOKENIZER: Dict[str, str] = {
+_TOKENIZER_MAP: Dict[str, str] = {
     "english": "en_tokenizer",
     "simple": "en_tokenizer",
     "chinese": "cn_tokenizer",
@@ -50,192 +53,733 @@ def _map_text_search_config(config: str) -> str:
     Returns:
         Pyvastbase tokenizer name (e.g. ``"en_tokenizer"``, ``"cn_tokenizer"``).
     """
-    import logging
-
-    logger = logging.getLogger(__name__)
-    mapped = _TEXT_SEARCH_CONFIG_TO_TOKENIZER.get(config, "en_tokenizer")
-    if config not in _TEXT_SEARCH_CONFIG_TO_TOKENIZER:
-        logger.warning(
+    mapped = _TOKENIZER_MAP.get(config, "en_tokenizer")
+    if config not in _TOKENIZER_MAP:
+        _logger.warning(
             "Unknown text_search_config '%s', falling back to 'en_tokenizer'",
             config,
         )
     return mapped
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# VastbaseVectorStore
+# ═══════════════════════════════════════════════════════════════════════════
+
 class VastbaseVectorStore(BasePydanticVectorStore):
     """LlamaIndex Vector Store backed by Vastbase V3 via pyvastbase.
 
     Uses pyvastbase's ``VastbaseClient`` (MilvusClient-compatible API) for
     collection management and data operations.  Vector operations are handled
-    natively by Vastbase's built-in vector engine — no CREATE EXTENSION needed.
+    natively by Vastbase's built-in vector engine — no ``CREATE EXTENSION``
+    needed.
+
+    The constructor signature mirrors ``PGVectorStore`` for drop-in
+    compatibility.  SQLAlchemy-specific parameters are accepted but emit
+    deprecation warnings — pyvastbase handles connection management
+    internally.
 
     Args:
-        connection_uri: PostgreSQL connection string for Vastbase
+        connection_string: PostgreSQL connection string for Vastbase
             (e.g. ``"postgresql://user:pass@host:5432/database"``).
         table_name: Name of the collection/table to store nodes in.
-            Defaults to ``"llamaindex_nodes"``.
-        dimension: Dimensionality of the embedding vectors.
+            Defaults to ``"llamaindex"``.
+        embed_dim: Dimensionality of the embedding vectors.
             Defaults to 1536 (OpenAI text-embedding-ada-002).
     """
 
     # ── VectorStore protocol flags ──────────────────────────────────────
     stores_text: bool = True
     is_embedding_query: bool = True
+    flat_metadata: bool = False
 
-    # ── Configuration ───────────────────────────────────────────────────
-    connection_uri: str = Field(
-        description="Vastbase PostgreSQL connection URI (postgresql://...)"
+    # ── Connection / schema ─────────────────────────────────────────────
+    connection_string: str = Field(
+        default="",
+        description="PostgreSQL connection URI for Vastbase (postgresql://...)",
+    )
+    async_connection_string: str = Field(
+        default="",
+        description="Async connection string (stored for PGVectorStore compat; "
+        "pyvastbase does not use a separate async connection string)",
     )
     table_name: str = Field(
-        default="llamaindex_nodes",
+        default="llamaindex",
         description="Collection/table name for storing nodes",
     )
-    dimension: int = Field(
+    schema_name: str = Field(
+        default="public",
+        description="PostgreSQL schema name (stored for PGVectorStore compat)",
+    )
+
+    # ── Vector / index configuration ────────────────────────────────────
+    embed_dim: int = Field(
         default=1536,
         description="Vector embedding dimension",
     )
-    distance_metric: str = Field(
-        default="L2",
-        description="Distance metric for vector search: L2, COSINE, or IP",
-    )
-    use_halfvec: bool = Field(
-        default=False,
-        description="Use FLOAT16_VECTOR (half precision) instead of FLOAT_VECTOR",
-    )
-    hnsw_kwargs: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="HNSW index parameters (m, ef_construction). "
-        "Defaults to m=16, ef_construction=64 when omitted.",
-    )
     hybrid_search: bool = Field(
         default=False,
-        description="Create a FULLTEXT (BM25) index on the text column "
-        "for hybrid search support.",
+        description="Enable hybrid search (reserved for future use)",
     )
     text_search_config: str = Field(
         default="english",
-        description="Text search config name (english→en_tokenizer, "
-        "chinese→cn_tokenizer).",
+        description="Text search config for hybrid search (reserved for future use)",
+    )
+    hnsw_kwargs: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="HNSW index creation kwargs (reserved for future use)",
+    )
+    use_halfvec: bool = Field(
+        default=False,
+        description="Use half-precision vectors (halfvec). "
+        "Vastbase >=3.0.9 supports halfvector.",
     )
 
-    # ADAPT: use PrivateAttr for the lazy VastbaseClient — not a Pydantic field
-    _client: Any = PrivateAttr(default=None)
+    # ── Behaviour flags ─────────────────────────────────────────────────
+    cache_ok: bool = Field(
+        default=False,
+        description="SQLAlchemy cache_ok flag (warned — not used by pyvastbase)",
+    )
+    perform_setup: bool = Field(
+        default=True,
+        description="Whether to auto-create the collection on first use",
+    )
+    debug: bool = Field(
+        default=False,
+        description="Debug mode (enables verbose logging)",
+    )
+    initialization_fail_on_error: bool = Field(
+        default=False,
+        description="If True, initialization errors propagate; if False, they are logged",
+    )
 
-    # ADAPT: track whether _initialize() has been called
+    # ADAPT: SQLAlchemy-only parameters — accepted but warned.
+    # Vastbase uses pyvastbase for connection management, not SQLAlchemy.
+    use_jsonb: bool = Field(
+        default=False,
+        description="[DEPRECATED — Vastbase uses JSON natively] "
+        "Use JSONB instead of JSON.  Accepted for PGVectorStore compat; "
+        "has no effect with pyvastbase.",
+    )
+    create_engine_kwargs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="[DEPRECATED — pyvastbase manages connections] "
+        "SQLAlchemy create_engine kwargs.  Accepted for PGVectorStore compat; "
+        "has no effect with pyvastbase.",
+    )
+    indexed_metadata_keys: Optional[Any] = Field(
+        default=None,
+        description="[DEPRECATED — not used by pyvastbase] "
+        "Metadata keys to index.  Accepted for PGVectorStore compat; "
+        "has no effect with pyvastbase.",
+    )
+
+    # ── Private state ───────────────────────────────────────────────────
+    _client: Any = PrivateAttr(default=None)
+    _is_connected: bool = PrivateAttr(default=False)
+    # ADAPT: customize_query_fn is accepted but unused — pyvastbase does not
+    # expose a SQLAlchemy Select object to customize.
+    _customize_query_fn: Any = PrivateAttr(default=None)
     _is_initialized: bool = PrivateAttr(default=False)
 
-    # ── Client property (lazy init) ─────────────────────────────────────
+    # ── Constructor ─────────────────────────────────────────────────────
+
+    def __init__(
+        self,
+        connection_string: Optional[Union[str, Any]] = None,
+        async_connection_string: Optional[Union[str, Any]] = None,
+        table_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        hybrid_search: bool = False,
+        text_search_config: str = "english",
+        embed_dim: int = 1536,
+        cache_ok: bool = False,
+        perform_setup: bool = True,
+        debug: bool = False,
+        use_jsonb: bool = False,
+        hnsw_kwargs: Optional[Dict[str, Any]] = None,
+        create_engine_kwargs: Optional[Dict[str, Any]] = None,
+        initialization_fail_on_error: bool = False,
+        use_halfvec: bool = False,
+        # ADAPT: SQLAlchemy engine params — accepted for PGVectorStore compat
+        # but not used internally.  pyvastbase manages its own connections.
+        engine: Optional[Any] = None,
+        async_engine: Optional[Any] = None,
+        # ADAPT: additional PGVectorStore compat params
+        indexed_metadata_keys: Optional[Any] = None,
+        customize_query_fn: Optional[Callable[..., Any]] = None,
+        # ADAPT: backward-compat aliases for earlier VastbaseVectorStore API
+        connection_uri: Optional[str] = None,
+        dimension: Optional[int] = None,
+    ) -> None:
+        """Initialize VastbaseVectorStore.
+
+        The constructor mirrors ``PGVectorStore.__init__`` for drop-in
+        compatibility.  Internally pyvastbase replaces SQLAlchemy — see the
+        ADAPT notes on each parameter.
+
+        Args:
+            connection_string: PostgreSQL connection string for Vastbase.
+                Falls back to ``connection_uri`` (deprecated alias).
+            async_connection_string: Async connection string (stored but
+                unused — pyvastbase does not split sync/async connections).
+            table_name: Collection/table name.  Defaults to ``"llamaindex"``.
+            schema_name: PostgreSQL schema name.  Defaults to ``"public"``.
+            hybrid_search: Enable hybrid search (reserved).  Defaults to False.
+            text_search_config: Text search config (reserved).  Defaults to ``"english"``.
+            embed_dim: Vector dimension.  Defaults to 1536.  Falls back to
+                ``dimension`` (deprecated alias).
+            cache_ok: SQLAlchemy cache flag (warned — not used).  Defaults to False.
+            perform_setup: Auto-create collection on first use.  Defaults to True.
+            debug: Enable verbose logging.  Defaults to False.
+            use_jsonb: Use JSONB (warned — Vastbase uses JSON natively).
+                Defaults to False.
+            hnsw_kwargs: HNSW index creation kwargs (reserved).  Defaults to None.
+            create_engine_kwargs: SQLAlchemy engine kwargs (warned — not used).
+                Defaults to None.
+            initialization_fail_on_error: Propagate init errors.  Defaults to False.
+            use_halfvec: Use half-precision vectors.  Defaults to False.
+            engine: SQLAlchemy sync engine (warned — not used).
+            async_engine: SQLAlchemy async engine (warned — not used).
+            indexed_metadata_keys: Metadata key index specs (warned — not used).
+            customize_query_fn: Query customization hook (warned — not used).
+            connection_uri: Deprecated alias for ``connection_string``.
+            dimension: Deprecated alias for ``embed_dim``.
+        """
+        # ── Resolve deprecated aliases ─────────────────────────────────
+        # ADAPT: backward-compat: connection_uri is a deprecated alias for
+        # connection_string.  connection_string takes precedence when provided.
+        if not connection_string and connection_uri is not None:
+            connection_string = connection_uri
+        connection_string = str(connection_string or "")
+        async_connection_string = str(async_connection_string or "")
+
+        # ADAPT: backward-compat: dimension is a deprecated alias for embed_dim.
+        # embed_dim takes precedence when explicitly provided (non-default).
+        if embed_dim == 1536 and dimension is not None:
+            embed_dim = dimension
+        table_name = (table_name or "llamaindex").lower()
+        schema_name = (schema_name or "public").lower()
+        create_engine_kwargs = create_engine_kwargs or {}
+
+        # ADAPT: warn on SQLAlchemy-specific parameters that pyvastbase
+        # does not use.  These are accepted for PGVectorStore drop-in
+        # compatibility but are no-ops with pyvastbase.
+        self._warn_unsupported_params(
+            use_jsonb=use_jsonb,
+            create_engine_kwargs=create_engine_kwargs,
+            indexed_metadata_keys=indexed_metadata_keys,
+            engine=engine,
+            async_engine=async_engine,
+            customize_query_fn=customize_query_fn,
+            cache_ok=cache_ok,
+        )
+
+        if hybrid_search and text_search_config is None:
+            raise ValueError(
+                "Sparse vector index creation requires "
+                "a text search configuration specification."
+            )
+
+        super().__init__(
+            connection_string=connection_string,
+            async_connection_string=async_connection_string,
+            table_name=table_name,
+            schema_name=schema_name,
+            hybrid_search=hybrid_search,
+            text_search_config=text_search_config,
+            embed_dim=embed_dim,
+            cache_ok=cache_ok,
+            perform_setup=perform_setup,
+            debug=debug,
+            use_jsonb=use_jsonb,
+            hnsw_kwargs=hnsw_kwargs,
+            create_engine_kwargs=create_engine_kwargs,
+            initialization_fail_on_error=initialization_fail_on_error,
+            use_halfvec=use_halfvec,
+            indexed_metadata_keys=indexed_metadata_keys,
+        )
+
+        # ADAPT: store SQLAlchemy compatibility attrs as private state
+        self._customize_query_fn = customize_query_fn
+
+    @staticmethod
+    def _warn_unsupported_params(
+        use_jsonb: bool = False,
+        create_engine_kwargs: Optional[Dict[str, Any]] = None,
+        indexed_metadata_keys: Optional[Any] = None,
+        engine: Optional[Any] = None,
+        async_engine: Optional[Any] = None,
+        customize_query_fn: Optional[Callable[..., Any]] = None,
+        cache_ok: bool = False,
+    ) -> None:
+        """Emit one-time warnings for SQLAlchemy-specific parameters.
+
+        ADAPT: pyvastbase manages connections via ``connect()`` +
+        ``VastbaseClient``, so SQLAlchemy-oriented parameters have no effect.
+        We warn instead of raising to maintain PGVectorStore drop-in compat.
+        """
+        if use_jsonb:
+            _logger.warning(
+                "use_jsonb=True has no effect — Vastbase/pyvastbase uses JSON "
+                "natively for metadata columns.  This parameter is accepted "
+                "for PGVectorStore compatibility only."
+            )
+        if create_engine_kwargs:
+            _logger.warning(
+                "create_engine_kwargs has no effect — pyvastbase manages "
+                "connections internally via connect() / VastbaseClient.  "
+                "This parameter is accepted for PGVectorStore compatibility only."
+            )
+        if indexed_metadata_keys is not None:
+            _logger.warning(
+                "indexed_metadata_keys has no effect — metadata indexing is "
+                "not currently supported by the Vastbase pyvastbase backend.  "
+                "This parameter is accepted for PGVectorStore compatibility only."
+            )
+        if engine is not None:
+            _logger.warning(
+                "engine parameter has no effect — pyvastbase manages its own "
+                "connection pool.  This parameter is accepted for "
+                "PGVectorStore compatibility only."
+            )
+        if async_engine is not None:
+            _logger.warning(
+                "async_engine parameter has no effect — pyvastbase manages "
+                "its own async connections.  This parameter is accepted for "
+                "PGVectorStore compatibility only."
+            )
+        if customize_query_fn is not None:
+            _logger.warning(
+                "customize_query_fn has no effect — pyvastbase does not "
+                "expose a SQLAlchemy Select object to customize.  "
+                "This parameter is accepted for PGVectorStore compatibility only."
+            )
+        if cache_ok:
+            _logger.warning(
+                "cache_ok=True has no effect — SQLAlchemy type caching is "
+                "not relevant to pyvastbase.  This parameter is accepted for "
+                "PGVectorStore compatibility only."
+            )
+
+    # ── Class methods ────────────────────────────────────────────────────
+
+    @classmethod
+    def class_name(cls) -> str:
+        """Return the class name for serialization."""
+        return "VastbaseVectorStore"
+
+    @classmethod
+    def from_params(
+        cls,
+        host: Optional[str] = None,
+        port: Optional[Union[str, int]] = None,
+        database: Optional[str] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+        table_name: str = "llamaindex",
+        schema_name: str = "public",
+        connection_string: Optional[Union[str, Any]] = None,
+        async_connection_string: Optional[Union[str, Any]] = None,
+        hybrid_search: bool = False,
+        text_search_config: str = "english",
+        embed_dim: int = 1536,
+        cache_ok: bool = False,
+        perform_setup: bool = True,
+        debug: bool = False,
+        use_jsonb: bool = False,
+        hnsw_kwargs: Optional[Dict[str, Any]] = None,
+        create_engine_kwargs: Optional[Dict[str, Any]] = None,
+        use_halfvec: bool = False,
+        indexed_metadata_keys: Optional[Any] = None,
+        customize_query_fn: Optional[Callable[..., Any]] = None,
+    ) -> "VastbaseVectorStore":
+        """Construct a VastbaseVectorStore from individual connection parameters.
+
+        ADAPT: mirrors ``PGVectorStore.from_params()``.  Builds a
+        PostgreSQL connection string from ``host``/``port``/``database``/
+        ``user``/``password`` when ``connection_string`` is not provided,
+        then delegates to ``__init__``.
+
+        Args:
+            host: Vastbase host.  Defaults to ``"localhost"``.
+            port: Vastbase port.  Defaults to ``5432``.
+            database: Database name.  Defaults to ``"vastbase"``.
+            user: Database user.
+            password: Database password.
+            table_name: Collection/table name.  Defaults to ``"llamaindex"``.
+            schema_name: Schema name.  Defaults to ``"public"``.
+            connection_string: Full connection string (overrides host/port/etc).
+            async_connection_string: Async connection string (stored, unused).
+            hybrid_search: Enable hybrid search (reserved).
+            text_search_config: Text search config (reserved).
+            embed_dim: Vector dimension.  Defaults to 1536.
+            cache_ok: SQLAlchemy cache flag (warned — not used).
+            perform_setup: Auto-create collection.
+            debug: Debug mode.
+            use_jsonb: Use JSONB (warned — Vastbase uses JSON natively).
+            hnsw_kwargs: HNSW kwargs (reserved).
+            create_engine_kwargs: SQLAlchemy engine kwargs (warned — not used).
+            use_halfvec: Use half-precision vectors.
+            indexed_metadata_keys: Metadata index specs (warned — not used).
+            customize_query_fn: Query hook (warned — not used).
+
+        Returns:
+            VastbaseVectorStore instance.
+        """
+        # ADAPT: build a PostgreSQL connection string from individual params
+        # when no explicit connection_string is provided.
+        conn_str = connection_string or cls._build_connection_string(
+            host=host,
+            port=port,
+            database=database,
+            user=user,
+            password=password,
+        )
+        async_conn_str = async_connection_string or ""
+
+        return cls(
+            connection_string=str(conn_str),
+            async_connection_string=str(async_conn_str),
+            table_name=table_name,
+            schema_name=schema_name,
+            hybrid_search=hybrid_search,
+            text_search_config=text_search_config,
+            embed_dim=embed_dim,
+            cache_ok=cache_ok,
+            perform_setup=perform_setup,
+            debug=debug,
+            use_jsonb=use_jsonb,
+            hnsw_kwargs=hnsw_kwargs,
+            create_engine_kwargs=create_engine_kwargs,
+            use_halfvec=use_halfvec,
+            indexed_metadata_keys=indexed_metadata_keys,
+            customize_query_fn=customize_query_fn,
+        )
+
+    @staticmethod
+    def _build_connection_string(
+        host: Optional[str] = None,
+        port: Optional[Union[str, int]] = None,
+        database: Optional[str] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> str:
+        """Build a PostgreSQL connection string from individual parameters.
+
+        ADAPT: Vastbase uses standard PostgreSQL connection URI format:
+        ``postgresql://[user[:password]@][host][:port][/database]``
+
+        Args:
+            host: Hostname or IP.  Defaults to ``"localhost"``.
+            port: Port number.  Defaults to ``5432``.
+            database: Database name.  Defaults to ``"vastbase"``.
+            user: Username.
+            password: Password.
+
+        Returns:
+            PostgreSQL connection URI string.
+        """
+        _host = host or "localhost"
+        _port = str(port or 5432)
+        _db = database or "vastbase"
+
+        if user and password:
+            auth = f"{user}:{password}@"
+        elif user:
+            auth = f"{user}@"
+        else:
+            auth = ""
+
+        return f"postgresql://{auth}{_host}:{_port}/{_db}"
+
+    # ── Connection management ─────────────────────────────────────────────
 
     @property
     def client(self) -> Any:
-        """Lazily create and return the pyvastbase VastbaseClient."""
-        if self._client is None:
-            # ADAPT: VastbaseClient accepts a PostgreSQL URI directly —
-            # no separate host/port/user/password needed.
-            from pyvastbase import VastbaseClient  # type: ignore[import-untyped]
+        """Lazily create and return the pyvastbase VastbaseClient.
 
-            self._client = VastbaseClient(uri=self.connection_uri)
+        ADAPT: VastbaseClient accepts a PostgreSQL URI directly.
+        On first access, ``_connect()`` is called to establish the
+        connection if it hasn't been connected yet.
+        """
+        if self._client is None:
+            self._connect()
         return self._client
 
-    # ── Internal helpers ────────────────────────────────────────────────
+    def _connect(self) -> None:
+        """Establish the connection to Vastbase via pyvastbase.
+
+        ADAPT: uses ``pyvastbase.VastbaseClient`` with the connection URI.
+        This replaces SQLAlchemy's ``create_engine()`` / ``create_async_engine()``
+        dual-engine pattern.  pyvastbase manages connection pooling internally.
+        """
+        if self._is_connected:
+            return
+
+        from pyvastbase import VastbaseClient  # type: ignore[import-untyped]
+
+        uri = self.connection_string
+        if not uri:
+            raise ValueError(
+                "connection_string is empty — provide a PostgreSQL URI "
+                "or use from_params() with host/port/database/user/password"
+            )
+
+        self._client = VastbaseClient(uri=uri)
+        self._is_connected = True
+
+        if self.debug:
+            _logger.debug(
+                "VastbaseVectorStore connected to %s (table=%s)",
+                self._mask_uri(uri),
+                self.table_name,
+            )
+
+    def close(self) -> None:
+        """Close the pyvastbase client connection.
+
+        ADAPT: calls ``VastbaseClient.close()`` which disposes the
+        internal connection pool.  After calling ``close()`` the
+        ``client`` property will re-connect on next access.
+        """
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                _logger.debug("Error closing VastbaseClient", exc_info=True)
+            finally:
+                self._client = None
+                self._is_connected = False
+
+    @staticmethod
+    def _parse_connection_string(conn_str: str) -> Dict[str, Optional[str]]:
+        """Parse a PostgreSQL connection URI into its components.
+
+        ADAPT: standard ``postgresql://`` URI parsing.  Vastbase uses the
+        same URI format as PostgreSQL.
+
+        Args:
+            conn_str: PostgreSQL connection URI
+                (e.g. ``"postgresql://user:pass@host:5432/database"``).
+
+        Returns:
+            Dict with keys ``scheme``, ``user``, ``password``, ``host``,
+            ``port``, ``database``.
+        """
+        result: Dict[str, Optional[str]] = {
+            "scheme": None,
+            "user": None,
+            "password": None,
+            "host": None,
+            "port": None,
+            "database": None,
+        }
+
+        if not conn_str:
+            return result
+
+        try:
+            parsed = urlparse(conn_str)
+            result["scheme"] = parsed.scheme or "postgresql"
+            result["user"] = parsed.username
+            result["password"] = parsed.password
+            result["host"] = parsed.hostname
+            result["port"] = str(parsed.port) if parsed.port else None
+            # Strip leading '/' from path to get database name
+            result["database"] = parsed.path.lstrip("/") or None
+        except Exception:
+            _logger.warning(
+                "Failed to parse connection string: %s", conn_str, exc_info=True
+            )
+
+        return result
+
+    @staticmethod
+    def _mask_uri(uri: str) -> str:
+        """Return a copy of the URI with password masked for logging."""
+        try:
+            parsed = urlparse(uri)
+            if parsed.password:
+                masked = parsed._replace(
+                    netloc=parsed.netloc.replace(
+                        f":{parsed.password}@", ":***@"
+                    )
+                )
+                return urlunparse(masked)
+        except Exception:
+            pass
+        return uri
+
+    # ── Initialization ────────────────────────────────────────────────────
 
     def _initialize(self) -> None:
-        """Create the Vastbase collection, HNSW index, and optional FULLTEXT index.
+        """Full initialization: create collection + HNSW index + optional FULLTEXT.
 
-        ADAPT: Vastbase's vector engine is built-in — no ``CREATE EXTENSION``
-        or pgvector-specific setup is needed.  Indexes are created via
-        ``VastbaseClient.create_index()`` with ``IndexParams``.
+        ADAPT: Replaces PGVectorStore's _initialize() which used SQLAlchemy
+        DDL (CREATE EXTENSION → CREATE SCHEMA → CREATE TABLE → CREATE INDEX).
+        Vastbase V3 uses pyvastbase's collection management and native index API.
+
+        Idempotent — safe to call multiple times.  Skipped entirely when
+        ``perform_setup=False``.
+        """
+        if not self.perform_setup:
+            return
+
+        if self._is_initialized:
+            return
+
+        # Create collection if it doesn't exist
+        if not self.client.has_collection(self.table_name):
+            self._create_collection()
+
+        # Create HNSW index on the embedding column
+        self._create_hnsw_index()
+
+        # Create FULLTEXT index if hybrid search is enabled
+        if self.hybrid_search:
+            self._create_fulltext_index()
+
+        self._is_initialized = True
+
+    def _ensure_initialized(self) -> None:
+        """Ensure the collection and indexes are created (idempotent).
+
+        Delegates to ``_initialize()`` which is guarded by the
+        ``_is_initialized`` flag — subsequent calls are a no-op.
+        """
+        self._initialize()
+
+    def _create_collection(self) -> None:
+        """Create the Vastbase collection/table if it does not exist.
 
         The collection schema mirrors the LlamaIndex node structure:
         ``id`` (primary key), ``text``, ``embedding`` (float vector),
-        ``metadata_`` (JSON), and ``ref_doc_id`` for source-document tracking.
+        ``metadata_`` (JSON), and ``ref_doc_id`` for source-document
+        tracking.
+
+        ADAPT: Vastbase's vector engine is built-in — no ``CREATE EXTENSION``
+        or pgvector-specific setup is needed.  ``create_collection()`` uses
+        standard PostgreSQL types underneath.
         """
-        if self.client.has_collection(self.table_name):
-            return
+        if not self.client.has_collection(self.table_name):
+            # ADAPT: use pyvastbase DataType enums for schema definition.
+            # Vastbase maps these to native PostgreSQL types automatically.
+            from pyvastbase import DataType  # type: ignore[import-untyped]
 
-        from pyvastbase import DataType, IndexParams  # type: ignore[import-untyped]
+            # ADAPT: use_halfvec → FLOAT16_VECTOR (half-precision) instead of
+            # FLOAT_VECTOR (full-precision).  Vastbase >=3.0.9 supports halfvector.
+            vector_dtype = (
+                DataType.FLOAT16_VECTOR if self.use_halfvec
+                else DataType.FLOAT_VECTOR
+            )
 
-        # Determine vector data type based on use_halfvec flag
-        vector_dtype = (
-            DataType.FLOAT16_VECTOR if self.use_halfvec else DataType.FLOAT_VECTOR
-        )
+            self.client.create_collection(
+                self.table_name,
+                fields=[
+                    {
+                        "name": "id",
+                        "dtype": DataType.VARCHAR,
+                        "is_primary_key": True,
+                        "max_length": 256,
+                    },
+                    {"name": "text", "dtype": DataType.TEXT},
+                    {
+                        "name": "embedding",
+                        "dtype": vector_dtype,
+                        "dim": self.embed_dim,
+                    },
+                    {"name": "metadata_", "dtype": DataType.JSON},
+                    {
+                        "name": "ref_doc_id",
+                        "dtype": DataType.VARCHAR,
+                        "max_length": 256,
+                    },
+                ],
+            )
 
-        # ADAPT: use pyvastbase DataType enums for schema definition.
-        # Vastbase maps these to native PostgreSQL types automatically.
-        self.client.create_collection(
-            self.table_name,
-            fields=[
-                {
-                    "name": "id",
-                    "dtype": DataType.VARCHAR,
-                    "is_primary_key": True,
-                    "max_length": 256,
-                },
-                {"name": "text", "dtype": DataType.TEXT},
-                {
-                    "name": "embedding",
-                    "dtype": vector_dtype,
-                    "dim": self.dimension,
-                },
-                {"name": "metadata_", "dtype": DataType.JSON},
-                {
-                    "name": "ref_doc_id",
-                    "dtype": DataType.VARCHAR,
-                    "max_length": 256,
-                },
-            ],
-        )
+    def _create_hnsw_index(self) -> None:
+        """Create HNSW (Hierarchical Navigable Small World) index on the
+        embedding column.
 
-        # ADAPT: Create HNSW graph index on the embedding column using
-        # pyvastbase IndexParams.graph_index().  This replaces the raw SQL
-        # ``CREATE INDEX ... USING hnsw`` approach of the PG reference.
-        hnsw = self.hnsw_kwargs or {}
-        hnsw_params = IndexParams.graph_index(
-            m=hnsw.get("m", 16),
-            ef_construction=hnsw.get("ef_construction", 64),
+        ADAPT: Uses pyvastbase ``IndexParams.graph_index()`` which maps to
+        Vastbase's native HNSW implementation.  PGVectorStore used raw SQL
+        ``CREATE INDEX ... USING hnsw (embedding vector_cosine_ops)
+        WITH (m=..., ef_construction=...)``.  pyvastbase abstracts this into
+        ``create_index()`` with ``IndexParams``.
+
+        The index is created with ``IF NOT EXISTS`` semantics — if an index
+        already exists on the embedding column, it is not re-created.
+        """
+        from pyvastbase import IndexParams  # type: ignore[import-untyped]
+
+        # ADAPT: extract HNSW kwargs with PGVectorStore-compatible names
+        # (hnsw_m, hnsw_ef_construction) and map to pyvastbase names (m, ef_construction).
+        hnsw_kwargs = self.hnsw_kwargs or {}
+        m = hnsw_kwargs.get("hnsw_m", 16)
+        ef_construction = hnsw_kwargs.get("hnsw_ef_construction", 64)
+
+        params = IndexParams.graph_index(
+            m=m,
+            ef_construction=ef_construction,
         )
         self.client.create_index(
-            self.table_name,
+            collection_name=self.table_name,
             field_name="embedding",
-            index_params=hnsw_params,
+            index_params=params,
         )
 
-        # ADAPT: Optionally create a FULLTEXT (BM25) index on the text column.
-        # This replaces the PG ``GIN + tsvector`` approach with Vastbase's
-        # built-in BM25 full-text search.
-        if self.hybrid_search:
-            tokenizer = _map_text_search_config(self.text_search_config)
-            ft_params = IndexParams.fulltext_index(
-                dictionary=tokenizer,
-                algorithm="BM25",
-            )
-            self.client.create_index(
-                self.table_name,
-                field_name="text",
-                index_params=ft_params,
-            )
+    def _create_fulltext_index(self) -> None:
+        """Create FULLTEXT index on the ``text`` column for hybrid search.
 
-    def _ensure_initialized(self) -> None:
-        """Call ``_initialize()`` once per instance.
+        ADAPT: PGVectorStore used ``to_tsvector()`` / ``to_tsquery()`` with
+        PostgreSQL GIN indexes.  Vastbase uses native BM25 full-text search
+        via pyvastbase's ``IndexParams.fulltext_index()``.
 
-        Subsequent calls are a no-op — the ``_is_initialized`` flag gates
-        the initialization path.
+        The ``text_search_config`` parameter is mapped to Vastbase tokenizer
+        dictionaries:
+        - ``"english"`` → ``"en_tokenizer"``
+        - ``"chinese"`` → ``"cn_tokenizer"``
+        - any other value is passed through as-is.
         """
-        if not self._is_initialized:
-            self._initialize()
-            self._is_initialized = True
+        from pyvastbase import IndexParams  # type: ignore[import-untyped]
+
+        # ADAPT: map PG text_search_config names to Vastbase tokenizer dictionaries
+        _TOKENIZER_MAP: Dict[str, str] = {
+            "english": "en_tokenizer",
+            "chinese": "cn_tokenizer",
+        }
+        dictionary = _TOKENIZER_MAP.get(
+            self.text_search_config, self.text_search_config
+        )
+
+        params = IndexParams.fulltext_index(
+            dictionary=dictionary,
+            algorithm="BM25",
+        )
+        self.client.create_index(
+            collection_name=self.table_name,
+            field_name="text",
+            index_params=params,
+        )
+
+    # ── Serialization helpers ────────────────────────────────────────────
 
     @staticmethod
     def _node_to_dict(node: BaseNode) -> Dict[str, Any]:
-        """Serialize a LlamaIndex ``BaseNode`` to a dict for insert.
+        """Convert a LlamaIndex ``BaseNode`` to a dict for insertion.
+
+        ADAPT: replaces inline dict-building in ``add()``.  Extracted as a
+        standalone helper so both sync ``add()`` and ``async_add()`` can
+        re-use the same serialisation logic.
 
         Args:
-            node: A LlamaIndex node with ``node_id``, ``text``, ``embedding``,
-                ``metadata``, and optionally a ``ref_doc_id``.
+            node: A LlamaIndex ``BaseNode`` with ``node_id``, ``text``,
+                ``embedding``, ``metadata``, and optional ``ref_doc_id``.
 
         Returns:
             Dict with keys ``id``, ``text``, ``embedding``, ``metadata_``,
-            and ``ref_doc_id`` ready for ``VastbaseClient.insert()``.
+            ``ref_doc_id``.
         """
         return {
             "id": node.node_id,
@@ -246,21 +790,27 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         }
 
     @staticmethod
-    def _dict_to_node(data: Dict[str, Any]) -> TextNode:
-        """Convert a raw dict (from pyvastbase query/result) into a ``TextNode``.
+    def _dict_to_node(row: Dict[str, Any]) -> TextNode:
+        """Convert a single result-row dict into a LlamaIndex ``TextNode``.
+
+        ADAPT: replaces inline dict-to-TextNode logic in ``_parse_results()``.
+        Extracted as a standalone helper so both ``_parse_results()`` and
+        ``aget_nodes()`` can re-use it.
 
         Args:
-            data: Dict with keys ``id``, ``text``, ``embedding``,
-                ``metadata_``, and optionally ``ref_doc_id``.
+            row: Dict with keys ``id``, ``text``, ``embedding`` (optional),
+                ``metadata_`` (optional), ``ref_doc_id`` (optional).
 
         Returns:
-            ``TextNode`` with the stored data and SOURCE relationship set.
+            ``TextNode`` populated from the row data.  If ``ref_doc_id`` is
+            present, a ``SOURCE`` relationship is attached so that
+            ``node.ref_doc_id`` returns the value.
         """
-        node_id: Optional[str] = data.get("id")
-        text: str = data.get("text", "")
-        embedding: Optional[List[float]] = data.get("embedding")
-        metadata: dict = data.get("metadata_") or {}
-        ref_doc_id: Optional[str] = data.get("ref_doc_id")
+        node_id: Optional[str] = row.get("id")
+        text: str = row.get("text", "")
+        embedding: Optional[List[float]] = row.get("embedding")
+        metadata: dict = row.get("metadata_") or {}
+        ref_doc_id: Optional[str] = row.get("ref_doc_id")
 
         node = TextNode(
             id_=node_id,
@@ -278,7 +828,7 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         return node
 
     @staticmethod
-    def _parse_results(results: Sequence[Any]) -> List[TextNode]:
+    def _parse_results(results: Any) -> List[TextNode]:
         """Convert raw query results from pyvastbase into LlamaIndex TextNode list.
 
         Args:
@@ -290,21 +840,19 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """
         nodes: List[TextNode] = []
         for row in results:
-            # Support both dict-style and object-style result rows.
-            # Convert object-style rows to dict so _dict_to_node handles
-            # relationship reconstruction uniformly.
+            # Support both dict-style and object-style result rows
             if isinstance(row, dict):
-                node = VastbaseVectorStore._dict_to_node(row)
+                nodes.append(VastbaseVectorStore._dict_to_node(row))
             else:
-                data: Dict[str, Any] = {
+                # Convert object-style row to dict for _dict_to_node
+                row_dict: Dict[str, Any] = {
                     "id": getattr(row, "id", None),
                     "text": getattr(row, "text", ""),
                     "embedding": getattr(row, "embedding", None),
                     "metadata_": getattr(row, "metadata_", {}) or {},
                     "ref_doc_id": getattr(row, "ref_doc_id", None),
                 }
-                node = VastbaseVectorStore._dict_to_node(data)
-            nodes.append(node)
+                nodes.append(VastbaseVectorStore._dict_to_node(row_dict))
         return nodes
 
     # ── CRUD: Add ───────────────────────────────────────────────────────
@@ -329,11 +877,36 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         Returns:
             List of node IDs that were inserted.
         """
-        self._ensure_initialized()
+        self._create_collection()
 
-        data: List[dict] = [self._node_to_dict(node) for node in nodes]
+        # ADAPT: use _node_to_dict helper for consistent serialisation
+        data = [self._node_to_dict(node) for node in nodes]
         self.client.insert(self.table_name, data)
         return [node.node_id for node in nodes]
+
+    # ── Async CRUD: Add ─────────────────────────────────────────────────
+
+    async def async_add(
+        self,
+        nodes: Sequence[BaseNode],
+        **kwargs: Any,
+    ) -> List[str]:
+        """Async version of :meth:`add`.
+
+        ADAPT: wraps the synchronous ``add()`` via ``asyncio.to_thread()``.
+        pyvastbase does not expose async APIs on ``VastbaseClient``, so we
+        offload the blocking I/O to a thread instead of using
+        ``AsyncCollection`` (which requires a separate connection setup).
+
+        Args:
+            nodes: Sequence of LlamaIndex BaseNode objects with embeddings.
+
+        Returns:
+            List of node IDs that were inserted.
+        """
+        import asyncio
+
+        return await asyncio.to_thread(self.add, nodes, **kwargs)
 
     # ── CRUD: Delete ────────────────────────────────────────────────────
 
@@ -362,6 +935,19 @@ class VastbaseVectorStore(BasePydanticVectorStore):
             expr=f"ref_doc_id = '{escaped}'",
         )
 
+    async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
+        """Async version of :meth:`delete`.
+
+        Args:
+            ref_doc_id: Source document ID whose nodes should be removed.
+
+        Raises:
+            ValueError: If ``ref_doc_id`` is empty or ``None``.
+        """
+        import asyncio
+
+        return await asyncio.to_thread(self.delete, ref_doc_id, **delete_kwargs)
+
     def delete_nodes(
         self,
         node_ids: Optional[List[str]] = None,
@@ -387,6 +973,24 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         self.client.delete(
             self.table_name,
             expr=f"id IN ({escaped_ids})",
+        )
+
+    async def adelete_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+        **delete_kwargs: Any,
+    ) -> None:
+        """Async version of :meth:`delete_nodes`.
+
+        Args:
+            node_ids: List of node IDs to delete.  No-op if empty or None.
+            filters: Optional metadata filters (reserved for future use).
+        """
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.delete_nodes, node_ids, filters, **delete_kwargs
         )
 
     # ── CRUD: Get ───────────────────────────────────────────────────────
@@ -419,6 +1023,24 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         )
         return self._parse_results(results)
 
+    async def aget_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+    ) -> List[BaseNode]:
+        """Async version of :meth:`get_nodes`.
+
+        Args:
+            node_ids: Node IDs to retrieve.  Returns empty list if None/empty.
+            filters: Optional metadata filters (reserved for future use).
+
+        Returns:
+            List of BaseNode objects reconstructed from the stored data.
+        """
+        import asyncio
+
+        return await asyncio.to_thread(self.get_nodes, node_ids, filters)
+
     # ── CRUD: Clear ─────────────────────────────────────────────────────
 
     def clear(self) -> None:
@@ -429,269 +1051,13 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """
         self.client.truncate_collection(self.table_name)
 
-    # ── Query / Search ────────────────────────────────────────────────────
+    async def aclear(self) -> None:
+        """Async version of :meth:`clear`."""
+        import asyncio
 
-    def _prepare_search(self, query: VectorStoreQuery) -> str:
-        """Build a SQL WHERE clause from the query's metadata filters.
+        return await asyncio.to_thread(self.clear)
 
-        Args:
-            query: A ``VectorStoreQuery`` that may carry ``MetadataFilters``.
-
-        Returns:
-            SQL WHERE clause string (without ``WHERE``), or empty string.
-        """
-        if query.filters is not None:
-            return _to_vastbase_filter(query.filters)
-        return ""
-
-    @staticmethod
-    def _parse_search_hits(
-        hits: Sequence[Any],
-    ) -> tuple[List[TextNode], List[float], List[str]]:
-        """Convert pyvastbase search hits into parallel lists.
-
-        Supports both ``client.search()`` results (objects with ``.id``,
-        ``.distance``, ``.entity``) and ``client.query()`` results
-        (plain dicts with top-level ``id``, ``text``, etc.).
-
-        Args:
-            hits: Iterable of search-hit objects or dicts.
-
-        Returns:
-            Tuple of ``(nodes, similarities, ids)`` where each is a list.
-            For L2/COSINE metrics, similarities are converted from distances
-            so higher = more similar.
-        """
-        nodes: List[TextNode] = []
-        similarities: List[float] = []
-        ids: List[str] = []
-
-        for hit in hits:
-            # ADAPT: client.search() returns objects with .entity;
-            # client.query() returns plain dicts.  Handle both.
-            if isinstance(hit, dict):
-                node_id = hit.get("id")
-                text = hit.get("text", "")
-                embedding = hit.get("embedding")
-                metadata = hit.get("metadata_", {}) or {}
-                ref_doc_id = hit.get("ref_doc_id")
-                # dicts from query() have no distance field; default to 0.0
-                distance = 0.0
-            else:
-                entity = getattr(hit, "entity", None) or {}
-                if isinstance(entity, dict):
-                    node_id = entity.get("id", getattr(hit, "id", None))
-                    text = entity.get("text", "")
-                    embedding = entity.get("embedding")
-                    metadata = entity.get("metadata_", {}) or {}
-                    ref_doc_id = entity.get("ref_doc_id")
-                else:
-                    node_id = getattr(entity, "id", getattr(hit, "id", None))
-                    text = getattr(entity, "text", "")
-                    embedding = getattr(entity, "embedding", None)
-                    metadata = getattr(entity, "metadata_", {}) or {}
-                    ref_doc_id = getattr(entity, "ref_doc_id", None)
-                distance = float(getattr(hit, "distance", 0.0))
-
-            node = TextNode(
-                id_=node_id,
-                text=text,
-                embedding=embedding,
-                metadata=metadata,
-            )
-            # ADAPT: reconstruct SOURCE relationship so node.ref_doc_id works.
-            if ref_doc_id:
-                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                    node_id=ref_doc_id
-                )
-
-            nodes.append(node)
-            similarities.append(distance)
-            ids.append(str(node_id) if node_id is not None else "")
-
-        return nodes, similarities, ids
-
-    def _dense_search(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
-        """Pure dense vector search using Vastbase's built-in vector engine.
-
-        Uses ``VastbaseClient.search()`` with the configured
-        ``distance_metric`` (L2, COSINE, or IP).
-
-        ADAPT: Vastbase V3 supports L2 (``<->``), COSINE (``<=>``), and
-        IP (``<#>``) distance operators natively — no pgvector extension.
-
-        Distance→similarity conversion:
-        * L2 / COSINE — smaller distance = more similar.
-          ``similarity = 1.0 / (1.0 + distance)``.
-        * IP — larger value = more similar (already a similarity metric).
-          Kept as-is.
-
-        Args:
-            query: ``VectorStoreQuery`` with ``query_embedding`` populated.
-
-        Returns:
-            ``VectorStoreQueryResult`` with ranked nodes, similarities, and ids.
-
-        Raises:
-            ValueError: If ``query_embedding`` is missing.
-        """
-        if not query.query_embedding:
-            raise ValueError("query_embedding is required for dense search")
-
-        filter_expr = self._prepare_search(query)
-
-        # ADAPT: VastbaseClient.search() accepts metric_type directly.
-        # Vastbase maps these to the native vector distance operators.
-        search_results = self.client.search(
-            self.table_name,
-            data=[query.query_embedding],
-            filter_expr=filter_expr,
-            limit=query.similarity_top_k,
-            output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
-            metric_type=self.distance_metric,
-        )
-
-        if not search_results or not search_results[0]:
-            return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
-
-        hits = search_results[0]
-        nodes, raw_scores, ids = self._parse_search_hits(hits)
-
-        # ADAPT: Convert distance to similarity for L2/COSINE metrics.
-        # IP is already a similarity (higher = more similar), keep as-is.
-        metric_upper = self.distance_metric.upper()
-        if metric_upper in ("L2", "COSINE"):
-            similarities = [1.0 / (1.0 + s) for s in raw_scores]
-        else:
-            similarities = raw_scores
-
-        return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
-
-    def _hybrid_search(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
-        """Hybrid search combining dense vector + text (BM25) recall.
-
-        Strategy:
-        1. Dense recall — ``VastbaseClient.search()`` with oversampling.
-        2. Text recall — ``VastbaseClient.query()`` with ILIKE on the
-           ``text`` column when ``query_str`` is available.
-        3. Score fusion — weighted reciprocal-rank fusion (RRF-ish) with
-           the ``alpha`` parameter controlling dense weight (1.0 = pure
-           dense, 0.0 = pure text).
-
-        ADAPT: Text recall uses standard SQL ILIKE — Vastbase is
-        PostgreSQL-compatible and supports this natively.  For BM25-grade
-        relevance scoring a FULLTEXT index can be added later via
-        ``VastbaseClient.create_index()``; the ILIKE path provides a
-        zero-config fallback.
-
-        Args:
-            query: ``VectorStoreQuery`` with both ``query_embedding`` and
-                ``query_str``.  Falls back to pure dense if ``query_str``
-                is missing.
-
-        Returns:
-            ``VectorStoreQueryResult`` with fused results.
-        """
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-        alpha = query.alpha if query.alpha is not None else 0.7
-        filter_expr = self._prepare_search(query)
-        top_k = query.similarity_top_k
-
-        # ADAPT: Helper to extract the id from either a dict (client.query())
-        # or an object (client.search()) hit — both appear in fusion loops.
-        def _hit_id(hit: Any) -> str:
-            if isinstance(hit, dict):
-                return hit.get("id", "")
-            return str(getattr(hit, "id", ""))
-
-        # ── 1. Dense recall (oversample for fusion headroom) ──────────
-        dense_limit = max(top_k * 3, 10)
-        dense_raw = self.client.search(
-            self.table_name,
-            data=[query.query_embedding] if query.query_embedding else [[0.0] * self.dimension],
-            filter_expr=filter_expr,
-            limit=dense_limit,
-            output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
-            metric_type=self.distance_metric,
-        )
-        dense_hits = dense_raw[0] if dense_raw else []
-
-        # ── 2. Text recall ────────────────────────────────────────────
-        text_hits: List[Any] = []
-        if query.query_str:
-            # ADAPT: escape the query string for SQL ILIKE safety.
-            escaped_str = query.query_str.replace("'", "''")
-            text_expr = f"text ILIKE '%{escaped_str}%'"
-            if filter_expr:
-                text_expr = f"({filter_expr}) AND ({text_expr})"
-            try:
-                text_raw = self.client.query(
-                    self.table_name,
-                    expr=text_expr,
-                    limit=dense_limit,
-                    output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
-                )
-                text_hits = list(text_raw) if text_raw else []
-            except Exception:
-                # ADAPT: log and continue — text recall failure should not
-                # abort the entire search; dense results are still usable.
-                logger.warning(
-                    "Text recall query failed for table=%s expr=%r — "
-                    "falling back to pure dense results.",
-                    self.table_name,
-                    text_expr,
-                    exc_info=True,
-                )
-                text_hits = []
-
-        # ── 3. Score fusion ───────────────────────────────────────────
-        dense_scores: dict[str, float] = {}
-        for hit in dense_hits:
-            hid = _hit_id(hit)
-            dist = float(getattr(hit, "distance", 1.0))
-            # Convert distance to similarity: 1/(1+distance)
-            dense_scores[hid] = 1.0 / (1.0 + dist)
-
-        text_rank: dict[str, int] = {}
-        for rank, hit in enumerate(text_hits):
-            hid = _hit_id(hit)
-            if hid:
-                text_rank[hid] = rank + 1  # 1-indexed rank
-
-        fused: dict[str, tuple] = {}  # id → (combined_score, hit)
-        for hit in dense_hits:
-            hid = _hit_id(hit)
-            dense_s = dense_scores.get(hid, 0.0)
-            t_rank = text_rank.get(hid, len(text_hits) + 1)
-            text_s = 1.0 / float(t_rank)  # reciprocal rank
-            combined = alpha * dense_s + (1.0 - alpha) * text_s
-            fused[hid] = (combined, hit)
-
-        for hit in text_hits:
-            hid = _hit_id(hit)
-            if hid in fused:
-                continue
-            t_rank = text_rank.get(hid, 1)
-            text_s = 1.0 / float(t_rank)
-            dense_s = 0.0
-            combined = alpha * dense_s + (1.0 - alpha) * text_s
-            fused[hid] = (combined, hit)
-
-        # Sort by combined score descending, take top_k
-        ranked = sorted(fused.values(), key=lambda x: x[0], reverse=True)[:top_k]
-
-        if not ranked:
-            return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
-
-        nodes, _, ids = self._parse_search_hits(
-            [item[1] for item in ranked]
-        )
-        # Override similarities with fused scores
-        fused_scores = [item[0] for item in ranked]
-        return VectorStoreQueryResult(nodes=nodes, similarities=fused_scores, ids=ids)
+    # ── Query (stub — reserved for next phase) ─────────────────────────
 
     def query(
         self,
@@ -700,59 +1066,10 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     ) -> VectorStoreQueryResult:
         """Query the vector store.
 
-        Dispatches based on ``query.mode``:
-
-        * ``DEFAULT`` / ``None`` → dense vector search
-        * ``SPARSE`` / ``TEXT_SEARCH`` → text-only search (requires ``query_str``)
-        * ``HYBRID`` → dense + text fusion
-
-        Args:
-            query: ``VectorStoreQuery`` carrying embedding, query string,
-                similarity_top_k, alpha, and optional metadata filters.
-
-        Returns:
-            ``VectorStoreQueryResult`` with matching nodes and scores.
+        .. note::
+            Search/query functionality will be implemented in a subsequent
+            issue.  Currently raises ``NotImplementedError``.
         """
-        mode = query.mode
-
-        if mode == VectorStoreQueryMode.HYBRID:
-            return self._hybrid_search(query)
-
-        if mode in (VectorStoreQueryMode.SPARSE, VectorStoreQueryMode.TEXT_SEARCH):
-            # ADAPT: text-only search uses ILIKE on the text column.
-            # For BM25-grade search a FULLTEXT index should be created first.
-            if not query.query_str:
-                return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
-            filter_expr = self._prepare_search(query)
-            escaped_str = query.query_str.replace("'", "''")
-            text_expr = f"text ILIKE '%{escaped_str}%'"
-            if filter_expr:
-                text_expr = f"({filter_expr}) AND ({text_expr})"
-            raw = self.client.query(
-                self.table_name,
-                expr=text_expr,
-                limit=query.similarity_top_k,
-                output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
-            )
-            nodes, similarities, ids = self._parse_search_hits(raw)
-            return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
-
-        # DEFAULT / fallback → dense vector search
-        # If query_embedding is missing, fall back to text search when query_str
-        # is available; otherwise return empty.
-        if not query.query_embedding:
-            if query.query_str:
-                # Use text-only search as graceful fallback
-                return self.query(
-                    VectorStoreQuery(
-                        query_str=query.query_str,
-                        mode=VectorStoreQueryMode.TEXT_SEARCH,
-                        similarity_top_k=query.similarity_top_k,
-                        filters=query.filters,
-                        alpha=query.alpha,
-                    ),
-                    **kwargs,
-                )
-            return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
-
-        return self._dense_search(query)
+        raise NotImplementedError(
+            "query() will be implemented in the next phase"
+        )

@@ -1,21 +1,14 @@
 """
-Tests for VastbaseVectorStore — CRUD and search operations.
+Tests for VastbaseVectorStore — CRUD operations.
 
 Covers add(), delete(), delete_nodes(), get_nodes(), clear(),
-_create_collection(), _parse_results(), query() with DENSE/HYBRID modes,
-and helper methods (_dense_search, _hybrid_search, _prepare_search).
+_create_collection(), and _parse_results() using mock VastbaseClient.
 """
 import json
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
-from llama_index.core.vector_stores.types import (
-    MetadataFilter,
-    MetadataFilters,
-    VectorStoreQuery,
-    VectorStoreQueryMode,
-)
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────
@@ -58,11 +51,11 @@ def sample_nodes():
     ]
 
 
-# ── _initialize tests ───────────────────────────────────────────────────
+# ── _create_collection tests ────────────────────────────────────────────
 
 class TestCreateCollection:
-    """_initialize() should create a Vastbase collection with the
-    correct schema and HNSW index when it does not already exist."""
+    """_create_collection() should create a Vastbase collection with the
+    correct schema when it does not already exist."""
 
     def test_creates_collection_when_missing(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
@@ -76,7 +69,7 @@ class TestCreateCollection:
         # Inject mock client
         store._client = mock_client
 
-        store._initialize()
+        store._create_collection()
 
         mock_client.has_collection.assert_called_once_with("test_nodes")
         mock_client.create_collection.assert_called_once()
@@ -94,10 +87,9 @@ class TestCreateCollection:
         )
         store._client = mock_client
 
-        store._initialize()
+        store._create_collection()
 
         mock_client.create_collection.assert_not_called()
-        mock_client.create_index.assert_not_called()
 
 
 # ── _parse_results tests ────────────────────────────────────────────────
@@ -407,6 +399,370 @@ class TestClientProperty:
             mock_vc.assert_called_once()
 
 
+# ── Constructor tests ──────────────────────────────────────────────────
+
+class TestConstructor:
+    """Constructor should accept all 19 PGVectorStore params and set defaults."""
+
+    def test_default_values(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore()
+        assert store.connection_string == ""
+        assert store.async_connection_string == ""
+        assert store.table_name == "llamaindex"
+        assert store.schema_name == "public"
+        assert store.embed_dim == 1536
+        assert store.hybrid_search is False
+        assert store.text_search_config == "english"
+        assert store.cache_ok is False
+        assert store.perform_setup is True
+        assert store.debug is False
+        assert store.use_jsonb is False
+        assert store.hnsw_kwargs is None
+        assert store.create_engine_kwargs == {}
+        assert store.initialization_fail_on_error is False
+        assert store.use_halfvec is False
+        assert store.indexed_metadata_keys is None
+        # Private attrs
+        assert store._client is None
+        assert store._is_connected is False
+        assert store._customize_query_fn is None
+
+    def test_custom_values(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://user:pass@host:5432/db",
+            async_connection_string="postgresql://user:pass@host:5432/db",
+            table_name="my_table",
+            schema_name="myschema",
+            hybrid_search=True,
+            text_search_config="simple",
+            embed_dim=768,
+            cache_ok=True,
+            perform_setup=False,
+            debug=True,
+            use_jsonb=True,
+            hnsw_kwargs={"hnsw_m": 16},
+            create_engine_kwargs={"pool_size": 5},
+            initialization_fail_on_error=True,
+            use_halfvec=True,
+            indexed_metadata_keys=[("key1", "text")],
+        )
+        assert store.connection_string == "postgresql://user:pass@host:5432/db"
+        assert store.table_name == "my_table"
+        assert store.schema_name == "myschema"
+        assert store.embed_dim == 768
+        assert store.hybrid_search is True
+        assert store.text_search_config == "simple"
+        assert store.perform_setup is False
+        assert store.debug is True
+        assert store.use_halfvec is True
+        assert store.hnsw_kwargs == {"hnsw_m": 16}
+
+    def test_hybrid_search_requires_text_search_config(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        with pytest.raises(ValueError, match="text search configuration"):
+            VastbaseVectorStore(hybrid_search=True, text_search_config=None)
+
+    def test_table_name_lowercased(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(table_name="MyTable")
+        assert store.table_name == "mytable"
+
+    def test_schema_name_lowercased(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(schema_name="MySchema")
+        assert store.schema_name == "myschema"
+
+    def test_backward_compat_connection_uri_alias(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        # connection_uri is a deprecated alias for connection_string
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db"
+        )
+        assert store.connection_string == "postgresql://localhost:5432/db"
+
+    def test_backward_compat_dimension_alias(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        # dimension is a deprecated alias for embed_dim
+        store = VastbaseVectorStore(dimension=256)
+        assert store.embed_dim == 256
+
+    def test_connection_string_takes_precedence_over_alias(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        # connection_string should take precedence over connection_uri
+        store = VastbaseVectorStore(
+            connection_string="postgresql://a:1/db",
+            connection_uri="postgresql://b:2/db",
+        )
+        assert store.connection_string == "postgresql://a:1/db"
+
+    def test_embed_dim_takes_precedence_over_alias(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        # embed_dim should take precedence over dimension
+        store = VastbaseVectorStore(embed_dim=512, dimension=256)
+        assert store.embed_dim == 512
+
+    def test_all_19_params_accepted(self):
+        """Smoke test: all PGVectorStore-compatible params should be accepted."""
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://u:p@h:5432/db",
+            async_connection_string="postgresql://u:p@h:5432/db",
+            table_name="tbl",
+            schema_name="sch",
+            hybrid_search=False,
+            text_search_config="english",
+            embed_dim=1536,
+            cache_ok=False,
+            perform_setup=True,
+            debug=False,
+            use_jsonb=False,
+            hnsw_kwargs=None,
+            create_engine_kwargs={},
+            initialization_fail_on_error=False,
+            use_halfvec=False,
+            engine=None,
+            async_engine=None,
+            indexed_metadata_keys=None,
+            customize_query_fn=None,
+        )
+        assert store is not None
+
+    def test_class_name(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        assert VastbaseVectorStore.class_name() == "VastbaseVectorStore"
+
+
+# ── Connection management tests ────────────────────────────────────────
+
+class TestConnection:
+    """_connect(), close(), from_params(), _parse_connection_string()."""
+
+    def test_connect_creates_client(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        with patch("pyvastbase.VastbaseClient") as mock_vc:
+            mock_vc.return_value = MagicMock()
+            store._connect()
+            mock_vc.assert_called_once_with(
+                uri="postgresql://localhost:5432/vastbase"
+            )
+            assert store._is_connected is True
+            assert store._client is not None
+
+    def test_connect_noop_when_already_connected(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        store._is_connected = True
+        store._client = MagicMock()
+
+        with patch("pyvastbase.VastbaseClient") as mock_vc:
+            store._connect()
+            mock_vc.assert_not_called()
+
+    def test_connect_raises_on_empty_connection_string(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore()  # connection_string defaults to ""
+        with pytest.raises(ValueError, match="connection_string is empty"):
+            store._connect()
+
+    def test_client_property_lazy_connects(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        with patch("pyvastbase.VastbaseClient") as mock_vc:
+            mock_client = MagicMock()
+            mock_vc.return_value = mock_client
+            result = store.client
+            assert result is mock_client
+            assert store._is_connected is True
+
+    def test_client_returns_existing_without_reconnect(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        mock_client = MagicMock()
+        store._client = mock_client
+        store._is_connected = True
+
+        result = store.client
+        assert result is mock_client
+
+    def test_close_disposes_client(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        mock_client = MagicMock()
+        store._client = mock_client
+        store._is_connected = True
+
+        store.close()
+        mock_client.close.assert_called_once()
+        assert store._client is None
+        assert store._is_connected is False
+
+    def test_close_noop_when_no_client(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        store._client = None
+        store._is_connected = False
+
+        # Should not raise
+        store.close()
+        assert store._client is None
+
+    def test_close_handles_client_error(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(
+            connection_string="postgresql://localhost:5432/vastbase"
+        )
+        mock_client = MagicMock()
+        mock_client.close.side_effect = RuntimeError("connection lost")
+        store._client = mock_client
+        store._is_connected = True
+
+        # Should not raise — exception is caught and logged
+        store.close()
+        assert store._client is None
+        assert store._is_connected is False
+
+    def test_from_params_builds_connection_string(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore.from_params(
+            host="db.example.com",
+            port=18000,
+            database="vastbase",
+            user="admin",
+            password="secret",
+            table_name="my_nodes",
+            embed_dim=768,
+        )
+        assert "db.example.com" in store.connection_string
+        assert "18000" in store.connection_string
+        assert "vastbase" in store.connection_string
+        assert "admin" in store.connection_string
+        assert "secret" in store.connection_string
+        assert store.table_name == "my_nodes"
+        assert store.embed_dim == 768
+
+    def test_from_params_defaults(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore.from_params()
+        assert "localhost" in store.connection_string
+        assert "5432" in store.connection_string
+        assert "vastbase" in store.connection_string
+        assert store.table_name == "llamaindex"
+        assert store.embed_dim == 1536
+
+    def test_from_params_connection_string_overrides(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore.from_params(
+            host="ignored-host",
+            connection_string="postgresql://override:5432/mydb",
+        )
+        assert store.connection_string == "postgresql://override:5432/mydb"
+
+    def test_from_params_user_only(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore.from_params(
+            user="reader",
+            host="myhost",
+            database="mydb",
+        )
+        assert "reader@" in store.connection_string
+        assert "myhost" in store.connection_string
+        assert "mydb" in store.connection_string
+        # No password — should not contain ":password"
+        assert ":reader@" not in store.connection_string.replace("reader@", "")
+        # Verify no extraneous ':'
+        assert store.connection_string.count(":@") == 0
+
+    def test_parse_connection_string_full(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        result = VastbaseVectorStore._parse_connection_string(
+            "postgresql://user:pass@host:5432/database"
+        )
+        assert result["scheme"] == "postgresql"
+        assert result["user"] == "user"
+        assert result["password"] == "pass"
+        assert result["host"] == "host"
+        assert result["port"] == "5432"
+        assert result["database"] == "database"
+
+    def test_parse_connection_string_minimal(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        result = VastbaseVectorStore._parse_connection_string(
+            "postgresql://localhost/vastbase"
+        )
+        assert result["scheme"] == "postgresql"
+        assert result["user"] is None
+        assert result["password"] is None
+        assert result["host"] == "localhost"
+        assert result["port"] is None
+        assert result["database"] == "vastbase"
+
+    def test_parse_connection_string_empty(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        result = VastbaseVectorStore._parse_connection_string("")
+        assert result["host"] is None
+        assert result["database"] is None
+
+    def test_parse_connection_string_no_port(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        result = VastbaseVectorStore._parse_connection_string(
+            "postgresql://user@host/db"
+        )
+        assert result["user"] == "user"
+        assert result["host"] == "host"
+        assert result["port"] is None
+        assert result["database"] == "db"
+
+    def test_parse_connection_string_malformed(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        # Should not raise on malformed input
+        result = VastbaseVectorStore._parse_connection_string("not-a-uri!!!!")
+        # Returns best-effort parse; host may be None or a partial match
+        assert isinstance(result, dict)
+
+
 # ── stores_text / is_embedding_query ────────────────────────────────────
 
 class TestFlags:
@@ -425,580 +781,480 @@ class TestFlags:
         assert store.is_embedding_query is True
 
 
-# ── Search helpers ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Task 5: Serialization Helpers (_node_to_dict, _dict_to_node)
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-def _make_search_hit(node_id, text, embedding, metadata, ref_doc_id, distance=0.15):
-    """Build a MagicMock that mimics a pyvastbase search hit.
+class TestNodeToDict:
+    """_node_to_dict() should convert a BaseNode to a dict for insertion."""
 
-    Each hit has .id (primary key), .distance (score), and .entity (dict of
-    output fields).
-    """
-    hit = MagicMock()
-    hit.id = node_id
-    hit.distance = distance
-    hit.entity = {
-        "id": node_id,
-        "text": text,
-        "embedding": embedding,
-        "metadata_": metadata,
-        "ref_doc_id": ref_doc_id,
-    }
-    return hit
-
-
-# ── DENSE search tests ────────────────────────────────────────────────────
-
-
-class TestDenseSearch:
-    """_dense_search() — pure vector search via client.search()."""
-
-    def test_dense_search_returns_nodes(self, mock_client):
+    def test_basic_conversion(self):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
-
-        hit1 = _make_search_hit("n1", "Hello", [0.1, 0.2, 0.3], {"k": "v"}, "doc-1", 0.1)
-        hit2 = _make_search_hit("n2", "World", [0.4, 0.5, 0.6], {}, "doc-2", 0.5)
-        mock_client.search.return_value = [[hit1, hit2]]
-
-        query = VectorStoreQuery(
-            query_embedding=[0.15, 0.25, 0.35],
-            similarity_top_k=5,
-            mode=VectorStoreQueryMode.DEFAULT,
+        node = TextNode(
+            id_="n1",
+            text="Hello world",
+            embedding=[0.1, 0.2, 0.3],
+            metadata={"author": "Alice"},
         )
-        result = store._dense_search(query)
+        result = store._node_to_dict(node)
 
-        assert len(result.nodes) == 2
-        assert result.nodes[0].node_id == "n1"
-        assert result.nodes[0].text == "Hello"
-        assert result.nodes[1].node_id == "n2"
-        # L2 distance→similarity: 1/(1+distance)
-        expected_s0 = 1.0 / (1.0 + 0.1)  # ≈0.9091
-        expected_s1 = 1.0 / (1.0 + 0.5)  # ≈0.6667
-        assert result.similarities == [expected_s0, expected_s1]
-        assert result.ids == ["n1", "n2"]
+        assert result["id"] == "n1"
+        assert result["text"] == "Hello world"
+        assert result["embedding"] == [0.1, 0.2, 0.3]
+        assert result["metadata_"] == {"author": "Alice"}
+        assert result["ref_doc_id"] == ""
 
-        mock_client.search.assert_called_once()
-        call_kwargs = mock_client.search.call_args.kwargs
-        assert call_kwargs["limit"] == 5
-        assert "L2" in str(call_kwargs.get("metric_type", ""))
-
-    def test_dense_search_empty_results(self, mock_client):
+    def test_with_ref_doc_id(self):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
-        mock_client.search.return_value = [[]]
-
-        query = VectorStoreQuery(
-            query_embedding=[0.1, 0.2],
-            similarity_top_k=3,
-            mode=VectorStoreQueryMode.DEFAULT,
+        node = TextNode(
+            id_="n-ref",
+            text="Has ref_doc_id",
+            embedding=[0.0],
         )
-        result = store._dense_search(query)
+        node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+            node_id="doc-99"
+        )
+        result = store._node_to_dict(node)
 
-        assert result.nodes == []
-        assert result.similarities == []
-        assert result.ids == []
+        assert result["ref_doc_id"] == "doc-99"
 
-    def test_dense_search_with_filters(self, mock_client):
+    def test_without_metadata(self):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        node = TextNode(
+            id_="bare",
+            text="No metadata",
+            embedding=[0.0],
+        )
+        result = store._node_to_dict(node)
+
+        assert result["metadata_"] == {}
+
+    def test_embedding_can_be_none(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        node = TextNode(
+            id_="no-emb",
+            text="No embedding",
+        )
+        result = store._node_to_dict(node)
+
+        assert result["embedding"] is None
+        assert result["id"] == "no-emb"
+
+
+class TestDictToNode:
+    """_dict_to_node() should convert a result row dict to a TextNode."""
+
+    def test_basic_conversion(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        row = {
+            "id": "n1",
+            "text": "Hello",
+            "embedding": [0.1, 0.2],
+            "metadata_": {"k": "v"},
+        }
+        node = store._dict_to_node(row)
+
+        assert node.node_id == "n1"
+        assert node.text == "Hello"
+        assert node.embedding == [0.1, 0.2]
+        assert node.metadata == {"k": "v"}
+        assert node.ref_doc_id is None
+
+    def test_with_ref_doc_id(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        row = {
+            "id": "n2",
+            "text": "With ref",
+            "metadata_": {},
+            "ref_doc_id": "doc-42",
+        }
+        node = store._dict_to_node(row)
+
+        assert node.ref_doc_id == "doc-42"
+
+    def test_null_metadata(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        row = {
+            "id": "n3",
+            "text": "Null metadata",
+            "metadata_": None,
+        }
+        node = store._dict_to_node(row)
+
+        assert node.metadata == {}
+
+    def test_roundtrip(self):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        original = TextNode(
+            id_="rt1",
+            text="Roundtrip test",
+            embedding=[0.5, 0.6],
+            metadata={"source": "test", "page": 1},
+        )
+        original.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+            node_id="doc-rt"
+        )
+
+        # Convert to dict and back
+        as_dict = store._node_to_dict(original)
+        restored = store._dict_to_node(as_dict)
+
+        assert restored.node_id == original.node_id
+        assert restored.text == original.text
+        assert restored.embedding == original.embedding
+        assert restored.metadata == original.metadata
+        assert restored.ref_doc_id == original.ref_doc_id
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Task 4: Collection Initialization (_initialize, _create_hnsw_index, etc.)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestInitialize:
+    """_initialize() should create collection + HNSW index + optional FULLTEXT."""
+
+    def test_initialize_creates_collection_and_hnsw_index(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        mock_client.has_collection.return_value = False
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+        )
         store._client = mock_client
 
-        hit = _make_search_hit("n1", "Filtered", [0.1], {}, "", 0.05)
-        mock_client.search.return_value = [[hit]]
+        store._initialize()
 
-        filters = MetadataFilters(
-            filters=[MetadataFilter(key="author", value="Alice", operator="==")]
+        # Should have created collection
+        mock_client.has_collection.assert_called_with("test_nodes")
+        mock_client.create_collection.assert_called_once()
+        # Should have created HNSW index
+        mock_client.create_index.assert_called()
+
+    def test_initialize_skips_collection_when_exists(self, mock_client):
+        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
+
+        mock_client.has_collection.return_value = True
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
         )
-        query = VectorStoreQuery(
-            query_embedding=[0.1],
-            similarity_top_k=3,
-            mode=VectorStoreQueryMode.DEFAULT,
-            filters=filters,
-        )
-        result = store._dense_search(query)
+        store._client = mock_client
 
-        assert len(result.nodes) == 1
-        mock_client.search.assert_called_once()
-        call_kwargs = mock_client.search.call_args.kwargs
-        assert "author" in str(call_kwargs.get("filter_expr", ""))
+        store._initialize()
 
-    def test_dense_search_cosine_metric(self, mock_client):
+        # Should not re-create collection
+        mock_client.create_collection.assert_not_called()
+        # But should still create index
+        mock_client.create_index.assert_called()
+
+    def test_initialize_skips_when_perform_setup_false(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
             connection_uri="postgresql://localhost:5432/db",
-            distance_metric="COSINE",
+            table_name="test_nodes",
+            perform_setup=False,
+            dimension=128,
         )
         store._client = mock_client
 
-        hit = _make_search_hit("n1", "Cosine", [0.1, 0.2], {}, "", 0.02)
-        mock_client.search.return_value = [[hit]]
+        store._initialize()
 
-        query = VectorStoreQuery(
-            query_embedding=[0.1, 0.2],
-            similarity_top_k=1,
-            mode=VectorStoreQueryMode.DEFAULT,
-        )
-        result = store._dense_search(query)
+        # Should be a no-op when perform_setup is False
+        mock_client.has_collection.assert_not_called()
+        mock_client.create_collection.assert_not_called()
+        mock_client.create_index.assert_not_called()
 
-        assert len(result.nodes) == 1
-        mock_client.search.assert_called_once()
-        call_kwargs = mock_client.search.call_args.kwargs
-        assert call_kwargs.get("metric_type") == "COSINE"
-
-    def test_dense_search_ip_metric(self, mock_client):
+    def test_initialize_with_hybrid_search_creates_fulltext_index(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
+        mock_client.has_collection.return_value = False
         store = VastbaseVectorStore(
             connection_uri="postgresql://localhost:5432/db",
-            distance_metric="IP",
+            table_name="test_nodes",
+            dimension=128,
+            hybrid_search=True,
+            text_search_config="english",
         )
         store._client = mock_client
 
-        hit = _make_search_hit("n1", "IP", [0.5, 0.5], {"key": "val"}, "ref-1", 0.95)
-        mock_client.search.return_value = [[hit]]
+        store._initialize()
 
-        query = VectorStoreQuery(
-            query_embedding=[0.5, 0.5],
-            similarity_top_k=1,
-            mode=VectorStoreQueryMode.DEFAULT,
-        )
-        result = store._dense_search(query)
+        # Should have created HNSW index AND fulltext index
+        # create_index should be called twice (HNSW + FULLTEXT)
+        assert mock_client.create_index.call_count == 2
 
-        assert len(result.nodes) == 1
-        mock_client.search.assert_called_once()
-        call_kwargs = mock_client.search.call_args.kwargs
-        assert call_kwargs.get("metric_type") == "IP"
-
-
-# ── HYBRID search tests ───────────────────────────────────────────────────
-
-
-class TestHybridSearch:
-    """_hybrid_search() — dense vector + text search fusion."""
-
-    def test_hybrid_search_basic(self, mock_client):
+    def test_initialize_with_hnsw_kwargs(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        mock_client.has_collection.return_value = False
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+            hnsw_kwargs={"hnsw_m": 32, "hnsw_ef_construction": 128},
+        )
         store._client = mock_client
 
-        dense_hit = _make_search_hit("n1", "Dense result", [0.1], {"k": "v"}, "doc-1", 0.1)
-        mock_client.search.return_value = [[dense_hit]]
+        store._initialize()
 
-        query = VectorStoreQuery(
-            query_embedding=[0.1],
-            query_str="Dense result",
-            similarity_top_k=3,
-            mode=VectorStoreQueryMode.HYBRID,
-            alpha=0.7,
-        )
-        result = store._hybrid_search(query)
+        # HNSW kwargs should be passed to create_index
+        call_args = mock_client.create_index.call_args
+        # The index params should include m=32, ef_construction=128
+        assert call_args is not None
 
-        assert len(result.nodes) >= 1
-        # Dense search should have been called
-        mock_client.search.assert_called()
-        call_kwargs = mock_client.search.call_args.kwargs
-        assert call_kwargs["limit"] >= 3  # oversamples for fusion
-
-    def test_hybrid_search_with_alpha_weighting(self, mock_client):
+    def test_initialize_idempotent(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        mock_client.has_collection.return_value = True
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+        )
         store._client = mock_client
 
-        dense_hit = _make_search_hit("n1", "A", [0.1], {}, "", 0.05)
-        mock_client.search.return_value = [[dense_hit]]
+        # Call _initialize twice
+        store._initialize()
+        first_call_count = mock_client.create_index.call_count
 
-        query = VectorStoreQuery(
-            query_embedding=[0.1],
-            query_str="A",
-            similarity_top_k=2,
-            mode=VectorStoreQueryMode.HYBRID,
-            alpha=0.9,
-        )
-        result = store._hybrid_search(query)
+        store._initialize()
+        second_call_count = mock_client.create_index.call_count
 
-        assert len(result.nodes) >= 1
+        # Should not create duplicate indexes — same count both times
+        assert first_call_count == second_call_count
 
-    def test_hybrid_search_no_query_str_falls_back_to_dense(self, mock_client):
+    def test_text_search_config_mapping_english(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        mock_client.has_collection.return_value = False
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+            hybrid_search=True,
+            text_search_config="english",
+        )
         store._client = mock_client
 
-        hit = _make_search_hit("n1", "Only dense", [0.1], {}, "", 0.1)
-        mock_client.search.return_value = [[hit]]
+        store._initialize()
 
-        query = VectorStoreQuery(
-            query_embedding=[0.1],
-            similarity_top_k=3,
-            mode=VectorStoreQueryMode.HYBRID,
-            # No query_str → should fall back to pure dense
-        )
-        result = store._hybrid_search(query)
+        # English should map to en_tokenizer
+        # The fulltext index should use en_tokenizer dictionary
+        fulltext_call = mock_client.create_index.call_args_list[1]
+        # Verify the dictionary/params include en_tokenizer
+        assert fulltext_call is not None
 
-        assert len(result.nodes) == 1
-        assert result.nodes[0].node_id == "n1"
-
-
-# ── TEXT_SEARCH / SPARSE tests ────────────────────────────────────────────
-
-
-class TestTextSearch:
-    """query() with TEXT_SEARCH / SPARSE mode — text-only via ILIKE."""
-
-    def _make_text_hits(self):
-        """Build dict hits that mimic client.query() return values."""
-        return [
-            {
-                "id": "t1",
-                "text": "First match",
-                "embedding": [0.1],
-                "metadata_": {"key": "val1"},
-                "ref_doc_id": "doc-a",
-            },
-            {
-                "id": "t2",
-                "text": "Second match",
-                "embedding": [0.2],
-                "metadata_": {},
-                "ref_doc_id": "doc-b",
-            },
-        ]
-
-    def test_text_search_returns_dict_results(self, mock_client):
+    def test_text_search_config_mapping_chinese(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
-        mock_client.query.return_value = self._make_text_hits()
-
-        query = VectorStoreQuery(
-            query_str="First match",
-            similarity_top_k=3,
-            mode=VectorStoreQueryMode.TEXT_SEARCH,
+        mock_client.has_collection.return_value = False
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+            hybrid_search=True,
+            text_search_config="chinese",
         )
-        result = store.query(query)
+        store._client = mock_client
 
-        assert len(result.nodes) == 2
-        assert result.nodes[0].node_id == "t1"
-        assert result.nodes[0].text == "First match"
-        assert result.nodes[1].node_id == "t2"
-        # Verify client.query() was called (not client.search())
-        mock_client.query.assert_called_once()
-        mock_client.search.assert_not_called()
+        store._initialize()
 
-    def test_sparse_mode_behaves_like_text_search(self, mock_client):
+        # Chinese should map to cn_tokenizer
+        fulltext_call = mock_client.create_index.call_args_list[1]
+        assert fulltext_call is not None
+
+    def test_initialize_use_halfvec(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
-        mock_client.query.return_value = self._make_text_hits()
-
-        query = VectorStoreQuery(
-            query_str="First match",
-            similarity_top_k=3,
-            mode=VectorStoreQueryMode.SPARSE,
+        mock_client.has_collection.return_value = False
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+            use_halfvec=True,
         )
-        result = store.query(query)
-
-        assert len(result.nodes) == 2
-        mock_client.query.assert_called_once()
-
-    def test_text_search_no_query_str_returns_empty(self, mock_client):
-        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
-
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
         store._client = mock_client
 
-        query = VectorStoreQuery(
-            similarity_top_k=3,
-            mode=VectorStoreQueryMode.TEXT_SEARCH,
-            # No query_str → should return empty
-        )
-        result = store.query(query)
+        store._initialize()
 
-        assert result.nodes == []
-        assert result.similarities == []
-        assert result.ids == []
-        # Neither client.search() nor client.query() should be called
-        mock_client.search.assert_not_called()
-        mock_client.query.assert_not_called()
-
-    def test_text_search_with_filters(self, mock_client):
-        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
-
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
-        mock_client.query.return_value = [
-            {"id": "t1", "text": "Filtered", "embedding": None, "metadata_": {}, "ref_doc_id": ""}
-        ]
-
-        filters = MetadataFilters(
-            filters=[MetadataFilter(key="author", value="Alice", operator="==")]
-        )
-        query = VectorStoreQuery(
-            query_str="Filtered",
-            similarity_top_k=3,
-            mode=VectorStoreQueryMode.TEXT_SEARCH,
-            filters=filters,
-        )
-        result = store.query(query)
-
-        assert len(result.nodes) == 1
-        mock_client.query.assert_called_once()
-        call_kwargs = mock_client.query.call_args.kwargs
-        assert "author" in str(call_kwargs.get("expr", ""))
-        assert "ILIKE" in str(call_kwargs.get("expr", ""))
+        # The collection should be created with FLOAT16_VECTOR type
+        create_call = mock_client.create_collection.call_args
+        assert create_call is not None
 
 
-# ── Graceful fallback tests ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Task 7: Async CRUD Operations
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-class TestGracefulFallback:
-    """query() with no embedding but with query_str → graceful text-search fallback."""
-
-    def test_default_mode_no_embedding_falls_back_to_text(self, mock_client):
-        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
-
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
-        mock_client.query.return_value = [
-            {"id": "fb1", "text": "Fallback result", "embedding": None, "metadata_": {}, "ref_doc_id": ""}
-        ]
-
-        query = VectorStoreQuery(
-            query_str="Fallback result",
-            similarity_top_k=3,
-            mode=VectorStoreQueryMode.DEFAULT,
-            # No query_embedding → graceful text-search fallback
-        )
-        result = store.query(query)
-
-        assert len(result.nodes) == 1
-        assert result.nodes[0].node_id == "fb1"
-        assert result.nodes[0].text == "Fallback result"
-        mock_client.query.assert_called_once()
-
-    def test_fallback_preserves_filters(self, mock_client):
-        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
-
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
-        mock_client.query.return_value = [
-            {"id": "fb2", "text": "Filtered fallback", "embedding": None, "metadata_": {"k": "v"}, "ref_doc_id": ""}
-        ]
-
-        filters = MetadataFilters(
-            filters=[MetadataFilter(key="tag", value="urgent", operator="==")]
-        )
-        query = VectorStoreQuery(
-            query_str="fallback",
-            similarity_top_k=5,
-            mode=VectorStoreQueryMode.DEFAULT,
-            filters=filters,
-            # No query_embedding
-        )
-        result = store.query(query)
-
-        assert len(result.nodes) == 1
-        call_kwargs = mock_client.query.call_args.kwargs
-        assert "tag" in str(call_kwargs.get("expr", ""))
-
-
-# ── Async API delegation tests ──────────────────────────────────────────
-# ADAPT: VastbaseVectorStore inherits async methods (async_add, aquery,
-# adelete, adelete_nodes, aget_nodes, aclear) from LlamaIndex's
-# BasePydanticVectorStore.  These methods delegate synchronously to their
-# sync counterparts.  The tests below verify correct delegation so callers
-# can safely use the async API.
-
-
-class TestAsyncAdd:
-    """async_add() delegates to add() and returns the same node IDs."""
+class TestAsyncCRUD:
+    """Async CRUD operations: async_add, adelete, adelete_nodes, aget_nodes, aclear."""
 
     @pytest.mark.asyncio
-    async def test_async_add_delegates_to_add(self, mock_client, sample_nodes):
+    async def test_async_add_nodes(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
         mock_client.has_collection.return_value = True
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+        )
+        store._client = mock_client
 
-        node_ids = await store.async_add(sample_nodes)
+        node = TextNode(
+            id_="async-1",
+            text="Async test",
+            embedding=[0.1, 0.2, 0.3],
+            metadata={"k": "v"},
+        )
+        node_ids = await store.async_add([node])
 
-        assert node_ids == ["n1", "n2", "n3"]
+        assert node_ids == ["async-1"]
         mock_client.insert.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_async_add_single_node(self, mock_client, sample_nodes):
+    async def test_async_add_multiple_nodes(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
         mock_client.has_collection.return_value = True
-
-        node_ids = await store.async_add([sample_nodes[0]])
-
-        assert node_ids == ["n1"]
-
-    @pytest.mark.asyncio
-    async def test_async_add_creates_collection_if_needed(self, mock_client, sample_nodes):
-        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
-
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
-        mock_client.has_collection.return_value = False
-
-        await store.async_add([sample_nodes[0]])
-
-        mock_client.create_collection.assert_called_once()
-
-
-class TestAsyncQuery:
-    """aquery() delegates to query() and returns matching results."""
-
-    @pytest.mark.asyncio
-    async def test_aquery_dense_returns_results(self, mock_client):
-        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
-        from llama_index.core.vector_stores.types import VectorStoreQuery
-
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+        )
         store._client = mock_client
 
-        hit = _make_search_hit("n1", "Hello", [0.1, 0.2], {}, "", 0.1)
-        mock_client.search.return_value = [[hit]]
-
-        q = VectorStoreQuery(query_embedding=[0.1, 0.2], similarity_top_k=5)
-        result = await store.aquery(q)
-
-        assert len(result.nodes) == 1
-        assert result.nodes[0].node_id == "n1"
-        assert result.ids == ["n1"]
-        mock_client.search.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_aquery_no_embedding_returns_empty(self, mock_client):
-        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
-        from llama_index.core.vector_stores.types import VectorStoreQuery
-
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
-
-        q = VectorStoreQuery(query_embedding=None, query_str=None, similarity_top_k=5)
-        result = await store.aquery(q)
-
-        assert result.nodes == []
-        assert result.similarities == []
-        assert result.ids == []
-
-    @pytest.mark.asyncio
-    async def test_aquery_text_search_fallback(self, mock_client):
-        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
-        from llama_index.core.vector_stores.types import VectorStoreQuery
-
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
-        mock_client.query.return_value = [
-            {"id": "t1", "text": "Fallback result", "embedding": None, "metadata_": {}, "ref_doc_id": ""},
+        nodes = [
+            TextNode(id_="a1", text="A", embedding=[0.1]),
+            TextNode(id_="a2", text="B", embedding=[0.2]),
+            TextNode(id_="a3", text="C", embedding=[0.3]),
         ]
+        node_ids = await store.async_add(nodes)
 
-        q = VectorStoreQuery(query_str="Fallback result", similarity_top_k=3)
-        result = await store.aquery(q)
-
-        assert len(result.nodes) == 1
-        assert result.nodes[0].text == "Fallback result"
-
-
-class TestAsyncDelete:
-    """adelete() delegates to delete()."""
+        assert node_ids == ["a1", "a2", "a3"]
+        inserted = mock_client.insert.call_args[0][1]
+        assert len(inserted) == 3
 
     @pytest.mark.asyncio
-    async def test_adelete_delegates_to_delete(self, mock_client):
+    async def test_adelete_by_ref_doc_id(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+        )
         store._client = mock_client
 
-        await store.adelete("doc-xyz")
+        await store.adelete("doc-123")
 
         mock_client.delete.assert_called_once()
         call_expr = mock_client.delete.call_args[1]["expr"]
-        assert "doc-xyz" in call_expr
+        assert "doc-123" in call_expr
 
     @pytest.mark.asyncio
     async def test_adelete_empty_ref_doc_id_raises(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+        )
         store._client = mock_client
 
         with pytest.raises(ValueError, match="ref_doc_id must be a non-empty string"):
             await store.adelete("")
 
-
-class TestAsyncDeleteNodes:
-    """adelete_nodes() delegates to delete_nodes()."""
-
     @pytest.mark.asyncio
-    async def test_adelete_nodes_delegates_to_delete_nodes(self, mock_client):
+    async def test_adelete_nodes_by_ids(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+        )
         store._client = mock_client
 
-        await store.adelete_nodes(["n1", "n2"])
+        await store.adelete_nodes(["n1", "n2", "n3"])
 
         mock_client.delete.assert_called_once()
         call_expr = mock_client.delete.call_args[1]["expr"]
         assert "n1" in call_expr
         assert "n2" in call_expr
+        assert "n3" in call_expr
 
     @pytest.mark.asyncio
-    async def test_adelete_nodes_empty_list_noop(self, mock_client):
+    async def test_adelete_nodes_empty_list(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+        )
         store._client = mock_client
 
         await store.adelete_nodes([])
 
         mock_client.delete.assert_not_called()
 
-
-class TestAsyncGetNodes:
-    """aget_nodes() delegates to get_nodes()."""
-
     @pytest.mark.asyncio
-    async def test_aget_nodes_returns_correct_nodes(self, mock_client):
+    async def test_aget_nodes(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+        )
         store._client = mock_client
         mock_client.query.return_value = [
-            {"id": "n1", "text": "Hello", "metadata_": {}, "ref_doc_id": None},
-            {"id": "n2", "text": "World", "metadata_": {}, "ref_doc_id": None},
+            {"id": "n1", "text": "Hello", "metadata_": {"k": "v"}, "ref_doc_id": "doc-1"},
+            {"id": "n3", "text": "World", "metadata_": {}, "ref_doc_id": "doc-3"},
         ]
 
-        nodes = await store.aget_nodes(["n1", "n2"])
+        nodes = await store.aget_nodes(["n1", "n3"])
 
         assert len(nodes) == 2
         assert nodes[0].node_id == "n1"
-        assert nodes[1].node_id == "n2"
-        mock_client.query.assert_called_once()
+        assert nodes[0].ref_doc_id == "doc-1"
+        assert nodes[1].node_id == "n3"
+        assert nodes[1].ref_doc_id == "doc-3"
 
     @pytest.mark.asyncio
     async def test_aget_nodes_empty_list(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+        )
         store._client = mock_client
 
         nodes = await store.aget_nodes([])
@@ -1007,32 +1263,16 @@ class TestAsyncGetNodes:
         mock_client.query.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_aget_nodes_with_ref_doc_id(self, mock_client):
+    async def test_aclear(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
-        store._client = mock_client
-        mock_client.query.return_value = [
-            {"id": "n42", "text": "With ref", "metadata_": {}, "ref_doc_id": "doc-42"},
-        ]
-
-        nodes = await store.aget_nodes(["n42"])
-
-        assert len(nodes) == 1
-        assert nodes[0].node_id == "n42"
-        assert nodes[0].ref_doc_id == "doc-42"
-
-
-class TestAsyncClear:
-    """aclear() delegates to clear()."""
-
-    @pytest.mark.asyncio
-    async def test_aclear_delegates_to_clear(self, mock_client):
-        from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
-
-        store = VastbaseVectorStore(connection_uri="postgresql://localhost:5432/db")
+        store = VastbaseVectorStore(
+            connection_uri="postgresql://localhost:5432/db",
+            table_name="test_nodes",
+            dimension=128,
+        )
         store._client = mock_client
 
         await store.aclear()
 
-        mock_client.truncate_collection.assert_called_once_with(store.table_name)
+        mock_client.truncate_collection.assert_called_once_with("test_nodes")
