@@ -9,7 +9,7 @@ This module implements the CRUD operations and search (DENSE / HYBRID / TEXT)
 for the Vastbase vector store.
 """
 
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from pydantic import Field, PrivateAttr
 
@@ -23,6 +23,43 @@ from llama_index.core.vector_stores.types import (
 )
 
 from llama_index.vector_stores.vastbase.utils import _to_vastbase_filter
+
+
+# ── Text search config mapping ───────────────────────────────────────────
+
+
+# ADAPT: Vastbase uses pyvastbase tokenizer names instead of PG
+# text_search_config values.  Map PG config names to pyvastbase tokenizers.
+_TEXT_SEARCH_CONFIG_TO_TOKENIZER: Dict[str, str] = {
+    "english": "en_tokenizer",
+    "simple": "en_tokenizer",
+    "chinese": "cn_tokenizer",
+}
+
+
+def _map_text_search_config(config: str) -> str:
+    """Map a PG ``text_search_config`` name to a pyvastbase tokenizer.
+
+    ADAPT: Vastbase uses tokenizer names (``en_tokenizer``, ``cn_tokenizer``)
+    instead of PostgreSQL text search configuration names.  Unknown config
+    values fall back to ``en_tokenizer``.
+
+    Args:
+        config: A PG text search config name (e.g. ``"english"``, ``"chinese"``).
+
+    Returns:
+        Pyvastbase tokenizer name (e.g. ``"en_tokenizer"``, ``"cn_tokenizer"``).
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    mapped = _TEXT_SEARCH_CONFIG_TO_TOKENIZER.get(config, "en_tokenizer")
+    if config not in _TEXT_SEARCH_CONFIG_TO_TOKENIZER:
+        logger.warning(
+            "Unknown text_search_config '%s', falling back to 'en_tokenizer'",
+            config,
+        )
+    return mapped
 
 
 class VastbaseVectorStore(BasePydanticVectorStore):
@@ -61,9 +98,31 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         default="L2",
         description="Distance metric for vector search: L2, COSINE, or IP",
     )
+    use_halfvec: bool = Field(
+        default=False,
+        description="Use FLOAT16_VECTOR (half precision) instead of FLOAT_VECTOR",
+    )
+    hnsw_kwargs: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="HNSW index parameters (m, ef_construction). "
+        "Defaults to m=16, ef_construction=64 when omitted.",
+    )
+    hybrid_search: bool = Field(
+        default=False,
+        description="Create a FULLTEXT (BM25) index on the text column "
+        "for hybrid search support.",
+    )
+    text_search_config: str = Field(
+        default="english",
+        description="Text search config name (english→en_tokenizer, "
+        "chinese→cn_tokenizer).",
+    )
 
     # ADAPT: use PrivateAttr for the lazy VastbaseClient — not a Pydantic field
     _client: Any = PrivateAttr(default=None)
+
+    # ADAPT: track whether _initialize() has been called
+    _is_initialized: bool = PrivateAttr(default=False)
 
     # ── Client property (lazy init) ─────────────────────────────────────
 
@@ -80,46 +139,143 @@ class VastbaseVectorStore(BasePydanticVectorStore):
 
     # ── Internal helpers ────────────────────────────────────────────────
 
-    def _create_collection(self) -> None:
-        """Create the Vastbase collection/table if it does not exist.
+    def _initialize(self) -> None:
+        """Create the Vastbase collection, HNSW index, and optional FULLTEXT index.
+
+        ADAPT: Vastbase's vector engine is built-in — no ``CREATE EXTENSION``
+        or pgvector-specific setup is needed.  Indexes are created via
+        ``VastbaseClient.create_index()`` with ``IndexParams``.
 
         The collection schema mirrors the LlamaIndex node structure:
         ``id`` (primary key), ``text``, ``embedding`` (float vector),
-        ``metadata_`` (JSON), and ``ref_doc_id`` for source-document
-        tracking.
-
-        ADAPT: Vastbase's vector engine is built-in — no ``CREATE EXTENSION``
-        or pgvector-specific setup is needed.  ``create_collection()`` uses
-        standard PostgreSQL types underneath.
+        ``metadata_`` (JSON), and ``ref_doc_id`` for source-document tracking.
         """
-        if not self.client.has_collection(self.table_name):
-            # ADAPT: use pyvastbase DataType enums for schema definition.
-            # Vastbase maps these to native PostgreSQL types automatically.
-            from pyvastbase import DataType  # type: ignore[import-untyped]
+        if self.client.has_collection(self.table_name):
+            return
 
-            self.client.create_collection(
-                self.table_name,
-                fields=[
-                    {
-                        "name": "id",
-                        "dtype": DataType.VARCHAR,
-                        "is_primary_key": True,
-                        "max_length": 256,
-                    },
-                    {"name": "text", "dtype": DataType.TEXT},
-                    {
-                        "name": "embedding",
-                        "dtype": DataType.FLOAT_VECTOR,
-                        "dim": self.dimension,
-                    },
-                    {"name": "metadata_", "dtype": DataType.JSON},
-                    {
-                        "name": "ref_doc_id",
-                        "dtype": DataType.VARCHAR,
-                        "max_length": 256,
-                    },
-                ],
+        from pyvastbase import DataType, IndexParams  # type: ignore[import-untyped]
+
+        # Determine vector data type based on use_halfvec flag
+        vector_dtype = (
+            DataType.FLOAT16_VECTOR if self.use_halfvec else DataType.FLOAT_VECTOR
+        )
+
+        # ADAPT: use pyvastbase DataType enums for schema definition.
+        # Vastbase maps these to native PostgreSQL types automatically.
+        self.client.create_collection(
+            self.table_name,
+            fields=[
+                {
+                    "name": "id",
+                    "dtype": DataType.VARCHAR,
+                    "is_primary_key": True,
+                    "max_length": 256,
+                },
+                {"name": "text", "dtype": DataType.TEXT},
+                {
+                    "name": "embedding",
+                    "dtype": vector_dtype,
+                    "dim": self.dimension,
+                },
+                {"name": "metadata_", "dtype": DataType.JSON},
+                {
+                    "name": "ref_doc_id",
+                    "dtype": DataType.VARCHAR,
+                    "max_length": 256,
+                },
+            ],
+        )
+
+        # ADAPT: Create HNSW graph index on the embedding column using
+        # pyvastbase IndexParams.graph_index().  This replaces the raw SQL
+        # ``CREATE INDEX ... USING hnsw`` approach of the PG reference.
+        hnsw = self.hnsw_kwargs or {}
+        hnsw_params = IndexParams.graph_index(
+            m=hnsw.get("m", 16),
+            ef_construction=hnsw.get("ef_construction", 64),
+        )
+        self.client.create_index(
+            self.table_name,
+            field_name="embedding",
+            index_params=hnsw_params,
+        )
+
+        # ADAPT: Optionally create a FULLTEXT (BM25) index on the text column.
+        # This replaces the PG ``GIN + tsvector`` approach with Vastbase's
+        # built-in BM25 full-text search.
+        if self.hybrid_search:
+            tokenizer = _map_text_search_config(self.text_search_config)
+            ft_params = IndexParams.fulltext_index(
+                dictionary=tokenizer,
+                algorithm="BM25",
             )
+            self.client.create_index(
+                self.table_name,
+                field_name="text",
+                index_params=ft_params,
+            )
+
+    def _ensure_initialized(self) -> None:
+        """Call ``_initialize()`` once per instance.
+
+        Subsequent calls are a no-op — the ``_is_initialized`` flag gates
+        the initialization path.
+        """
+        if not self._is_initialized:
+            self._initialize()
+            self._is_initialized = True
+
+    @staticmethod
+    def _node_to_dict(node: BaseNode) -> Dict[str, Any]:
+        """Serialize a LlamaIndex ``BaseNode`` to a dict for insert.
+
+        Args:
+            node: A LlamaIndex node with ``node_id``, ``text``, ``embedding``,
+                ``metadata``, and optionally a ``ref_doc_id``.
+
+        Returns:
+            Dict with keys ``id``, ``text``, ``embedding``, ``metadata_``,
+            and ``ref_doc_id`` ready for ``VastbaseClient.insert()``.
+        """
+        return {
+            "id": node.node_id,
+            "text": node.get_content(),
+            "embedding": node.embedding,
+            "metadata_": node.metadata or {},
+            "ref_doc_id": node.ref_doc_id or "",
+        }
+
+    @staticmethod
+    def _dict_to_node(data: Dict[str, Any]) -> TextNode:
+        """Convert a raw dict (from pyvastbase query/result) into a ``TextNode``.
+
+        Args:
+            data: Dict with keys ``id``, ``text``, ``embedding``,
+                ``metadata_``, and optionally ``ref_doc_id``.
+
+        Returns:
+            ``TextNode`` with the stored data and SOURCE relationship set.
+        """
+        node_id: Optional[str] = data.get("id")
+        text: str = data.get("text", "")
+        embedding: Optional[List[float]] = data.get("embedding")
+        metadata: dict = data.get("metadata_") or {}
+        ref_doc_id: Optional[str] = data.get("ref_doc_id")
+
+        node = TextNode(
+            id_=node_id,
+            text=text,
+            embedding=embedding,
+            metadata=metadata,
+        )
+        # ADAPT: ref_doc_id is stored as a separate column but LlamaIndex
+        # exposes it as a read-only property backed by source_node.
+        # Reconstruct the SOURCE relationship so node.ref_doc_id works.
+        if ref_doc_id:
+            node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                node_id=ref_doc_id
+            )
+        return node
 
     @staticmethod
     def _parse_results(results: Sequence[Any]) -> List[TextNode]:
@@ -134,33 +290,20 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         """
         nodes: List[TextNode] = []
         for row in results:
-            # Support both dict-style and object-style result rows
+            # Support both dict-style and object-style result rows.
+            # Convert object-style rows to dict so _dict_to_node handles
+            # relationship reconstruction uniformly.
             if isinstance(row, dict):
-                node_id: Optional[str] = row.get("id")
-                text: str = row.get("text", "")
-                embedding: Optional[List[float]] = row.get("embedding")
-                metadata: dict = row.get("metadata_", {}) or {}
-                ref_doc_id: Optional[str] = row.get("ref_doc_id")
+                node = VastbaseVectorStore._dict_to_node(row)
             else:
-                node_id = getattr(row, "id", None)
-                text = getattr(row, "text", "")
-                embedding = getattr(row, "embedding", None)
-                metadata = getattr(row, "metadata_", {}) or {}
-                ref_doc_id = getattr(row, "ref_doc_id", None)
-
-            node = TextNode(
-                id_=node_id,
-                text=text,
-                embedding=embedding,
-                metadata=metadata,
-            )
-            # ADAPT: ref_doc_id is stored as a separate column but LlamaIndex
-            # exposes it as a read-only property backed by source_node.
-            # Reconstruct the SOURCE relationship so node.ref_doc_id works.
-            if ref_doc_id:
-                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                    node_id=ref_doc_id
-                )
+                data: Dict[str, Any] = {
+                    "id": getattr(row, "id", None),
+                    "text": getattr(row, "text", ""),
+                    "embedding": getattr(row, "embedding", None),
+                    "metadata_": getattr(row, "metadata_", {}) or {},
+                    "ref_doc_id": getattr(row, "ref_doc_id", None),
+                }
+                node = VastbaseVectorStore._dict_to_node(data)
             nodes.append(node)
         return nodes
 
@@ -186,20 +329,9 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         Returns:
             List of node IDs that were inserted.
         """
-        self._create_collection()
+        self._ensure_initialized()
 
-        data: List[dict] = []
-        for node in nodes:
-            data.append(
-                {
-                    "id": node.node_id,
-                    "text": node.get_content(),
-                    "embedding": node.embedding,
-                    "metadata_": node.metadata or {},
-                    "ref_doc_id": node.ref_doc_id or "",
-                }
-            )
-
+        data: List[dict] = [self._node_to_dict(node) for node in nodes]
         self.client.insert(self.table_name, data)
         return [node.node_id for node in nodes]
 

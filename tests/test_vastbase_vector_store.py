@@ -58,11 +58,11 @@ def sample_nodes():
     ]
 
 
-# ── _create_collection tests ────────────────────────────────────────────
+# ── _initialize tests ───────────────────────────────────────────────────
 
 class TestCreateCollection:
-    """_create_collection() should create a Vastbase collection with the
-    correct schema when it does not already exist."""
+    """_initialize() should create a Vastbase collection with the
+    correct schema and HNSW index when it does not already exist."""
 
     def test_creates_collection_when_missing(self, mock_client):
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
@@ -76,7 +76,7 @@ class TestCreateCollection:
         # Inject mock client
         store._client = mock_client
 
-        store._create_collection()
+        store._initialize()
 
         mock_client.has_collection.assert_called_once_with("test_nodes")
         mock_client.create_collection.assert_called_once()
@@ -94,9 +94,10 @@ class TestCreateCollection:
         )
         store._client = mock_client
 
-        store._create_collection()
+        store._initialize()
 
         mock_client.create_collection.assert_not_called()
+        mock_client.create_index.assert_not_called()
 
 
 # ── _parse_results tests ────────────────────────────────────────────────
