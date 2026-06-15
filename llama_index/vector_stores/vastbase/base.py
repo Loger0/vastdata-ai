@@ -12,6 +12,7 @@ drop-in compatibility.  Internally, pyvastbase replaces SQLAlchemy:
 
 import json
 import logging
+import math
 import re
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -62,6 +63,15 @@ def _validate_safe_id(value: str, label: str) -> None:
 # compatibility.  Vastbase/PostgreSQL supports the same type set, so the
 # same type names are valid.
 PGType = str  # simplified — see PGVectorStore for the full Literal
+
+# ── Framework-test compatibility exports ──────────────────────────────────
+
+# ADAPT: DBEmbeddingRow is a dict alias for framework-test compatibility.
+# PGVectorStore uses a TypedDict; we use a plain dict.
+DBEmbeddingRow = Dict[str, Any]
+
+# ADAPT: MMR prefetch factor from PGVectorStore reference implementation.
+DEFAULT_MMR_PREFETCH_FACTOR = 2
 
 
 _TOKENIZER_MAP: Dict[str, str] = {
@@ -1977,6 +1987,85 @@ class VastbaseVectorStore(BasePydanticVectorStore):
                 "rank": rank,
             })
         return rows
+
+    # ── MMR / session helpers (framework-test compatibility) ──────────────
+
+    @staticmethod
+    def _prepare_mmr_query(
+        query: VectorStoreQuery,
+        mmr_threshold: Optional[float],
+        mmr_prefetch_factor: Optional[float],
+        mmr_prefetch_k: Optional[int],
+    ) -> VectorStoreQuery:
+        """Prepare an MMR query by adjusting similarity_top_k for prefetch.
+
+        ADAPT: framework-test compatibility — PGVectorStore exposes this as
+        a static method.  We return a copy of *query* with
+        ``similarity_top_k`` adjusted for prefetch (but the actual prefetch
+        logic is handled in ``_mmr_query()``).
+
+        Args:
+            query: Original ``VectorStoreQuery``.
+            mmr_threshold: Relevance threshold multiplier.
+            mmr_prefetch_factor: Multiply ``similarity_top_k`` by this.
+            mmr_prefetch_k: Explicit prefetch count (overrides factor).
+
+        Returns:
+            A copy of *query* with adjusted ``similarity_top_k``.
+        """
+        factor = mmr_prefetch_factor if mmr_prefetch_factor is not None else DEFAULT_MMR_PREFETCH_FACTOR
+        prefetch = mmr_prefetch_k if mmr_prefetch_k is not None else int(query.similarity_top_k * factor)
+        return VectorStoreQuery(
+            query_embedding=query.query_embedding,
+            query_str=query.query_str,
+            similarity_top_k=max(prefetch, query.similarity_top_k),
+            mode=query.mode,
+            alpha=query.alpha,
+            doc_ids=query.doc_ids,
+            query_id=query.query_id,
+            filters=query.filters,
+            embedding_search_hparams=query.embedding_search_hparams,
+            node_ids=query.node_ids,
+        )
+
+    @staticmethod
+    def _get_query_session_settings(query: VectorStoreQuery) -> List[str]:
+        """Extract session-level settings from the query.
+
+        ADAPT: PGVectorStore uses this to emit ``SET LOCAL`` statements
+        before query execution (e.g. ``SET LOCAL ivfflat.probes = N``).
+        pyvastbase does not expose session-level SQL configuration, so we
+        return an empty list.
+
+        Args:
+            query: A ``VectorStoreQuery`` (unused).
+
+        Returns:
+            Empty list — no session settings needed for pyvastbase.
+        """
+        return []
+
+    # ── Async query dispatch ─────────────────────────────────────────────
+
+    async def aquery(
+        self, query: VectorStoreQuery, **kwargs: Any
+    ) -> VectorStoreQueryResult:
+        """Async version of :meth:`query`.
+
+        ADAPT: wraps the synchronous ``query()`` via ``asyncio.to_thread()``.
+        pyvastbase does not expose native async search APIs, so we offload
+        blocking I/O to a thread.
+
+        Args:
+            query: A ``VectorStoreQuery`` specifying search mode and params.
+            **kwargs: Additional arguments forwarded to ``query()``.
+
+        Returns:
+            ``VectorStoreQueryResult`` with nodes, similarities, and ids.
+        """
+        import asyncio
+
+        return await asyncio.to_thread(self.query, query, **kwargs)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
