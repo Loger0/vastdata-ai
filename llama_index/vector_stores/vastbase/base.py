@@ -24,7 +24,12 @@ from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
     MetadataFilters,
     VectorStoreQuery,
+    VectorStoreQueryMode,
     VectorStoreQueryResult,
+)
+
+from llama_index.vector_stores.vastbase.utils import (  # noqa: E402
+    _to_vastbase_filter,
 )
 
 _logger = logging.getLogger(__name__)
@@ -1276,19 +1281,679 @@ class VastbaseVectorStore(BasePydanticVectorStore):
 
         return await asyncio.to_thread(self.clear)
 
-    # ── Query (stub — reserved for next phase) ─────────────────────────
+# ── Filter clause building ──────────────────────────────────────────────
+
+    def _build_filter_clause(
+        self, filters: Optional[MetadataFilters]
+    ) -> str:
+        """Convert MetadataFilters to a SQL WHERE clause string.
+
+        Delegates to :func:`_to_vastbase_filter` from ``.utils`` and wraps
+        the result in parentheses for safe composition with other clauses.
+
+        Args:
+            filters: Optional ``MetadataFilters`` instance.
+
+        Returns:
+            SQL WHERE clause string (without leading ``WHERE``), or empty
+            string if no filters are present.
+        """
+        if filters is None:
+            return ""
+        return _to_vastbase_filter(filters)
+
+    # ── Query engine ──────────────────────────────────────────────────────
 
     def query(
         self,
         query: VectorStoreQuery,
         **kwargs: Any,
     ) -> VectorStoreQueryResult:
-        """Query the vector store.
+        """Query the Vastbase vector store.
 
-        .. note::
-            Search/query functionality will be implemented in a subsequent
-            issue.  Currently raises ``NotImplementedError``.
+        Dispatches to the appropriate internal method based on
+        ``query.mode``.
+
+        Args:
+            query: ``VectorStoreQuery`` with embedding, filters, and mode.
+            **kwargs: Additional search parameters.
+
+        Returns:
+            ``VectorStoreQueryResult`` with matched nodes, similarities, and IDs.
+
+        Raises:
+            ValueError: If ``query.mode`` is not one of the supported modes.
         """
-        raise NotImplementedError(
-            "query() will be implemented in the next phase"
+        if query.mode == VectorStoreQueryMode.HYBRID:
+            return self._hybrid_query(query, **kwargs)
+        elif query.mode in (
+            VectorStoreQueryMode.SPARSE,
+            VectorStoreQueryMode.TEXT_SEARCH,
+        ):
+            return self._build_sparse_query(query, **kwargs)
+        elif query.mode == VectorStoreQueryMode.MMR:
+            return self._mmr_query(query, **kwargs)
+        elif query.mode == VectorStoreQueryMode.DEFAULT:
+            return self._build_query(query, **kwargs)
+        else:
+            raise ValueError(
+                f"Unsupported query mode: {query.mode}. "
+                f"Supported modes: DEFAULT, SPARSE, TEXT_SEARCH, HYBRID, MMR."
+            )
+
+    def _build_query(
+        self,
+        query: VectorStoreQuery,
+        **kwargs: Any,
+    ) -> VectorStoreQueryResult:
+        """DENSE vector similarity search.
+
+        Uses pyvastbase ``VastbaseClient.search()`` for native Vastbase
+        vector similarity search with optional metadata filtering.
+
+        Args:
+            query: ``VectorStoreQuery`` with ``query_embedding`` populated.
+            **kwargs: Additional search parameters.
+
+        Returns:
+            ``VectorStoreQueryResult``.
+
+        Raises:
+            ValueError: If ``query_embedding`` is ``None``.
+        """
+        embedding = query.query_embedding
+        if embedding is None:
+            raise ValueError(
+                "query_embedding is required for DEFAULT mode vector search"
+            )
+
+        filter_expr = self._build_filter_clause(query.filters) or None
+        limit = query.similarity_top_k
+
+        results = self.client.search(
+            self.table_name,
+            data=[embedding],
+            anns_field="embedding",
+            param={"metric_type": "COSINE"},
+            limit=limit,
+            expr=filter_expr,
+            output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
         )
+
+        return self._search_results_to_query_result(results)
+
+    def _build_sparse_query(
+        self,
+        query: VectorStoreQuery,
+        **kwargs: Any,
+    ) -> VectorStoreQueryResult:
+        """SPARSE / TEXT_SEARCH via PostgreSQL full-text search.
+
+        Executes a ``plainto_tsquery`` / ``ts_rank`` query against the
+        ``text`` column via a raw psycopg connection.  This provides
+        BM25-style relevance ranking for keyword search.
+
+        ADAPT: Uses PostgreSQL full-text search (``plainto_tsquery``,
+        ``ts_rank``) which Vastbase supports natively.  pyvastbase's
+        ``query()`` API does not expose ``ORDER BY``, so we go through a
+        raw psycopg connection for ranked text search.
+
+        Args:
+            query: ``VectorStoreQuery`` with ``query_str`` populated.
+            **kwargs: Additional search parameters.
+
+        Returns:
+            ``VectorStoreQueryResult``.
+
+        Raises:
+            ValueError: If ``query_str`` is ``None``.
+        """
+        import psycopg  # type: ignore[import-untyped]
+
+        query_str = query.query_str
+        if not query_str:
+            raise ValueError(
+                "query_str is required for SPARSE/TEXT_SEARCH mode"
+            )
+
+        limit = query.sparse_top_k or query.similarity_top_k
+        filter_clause = self._build_filter_clause(query.filters)
+
+        # ADAPT: PostgreSQL full-text search uses plainto_tsquery for
+        # user-friendly query parsing.  This is compatible with Vastbase's
+        # built-in text search engine.
+        table_name = self.table_name
+        config = self.text_search_config
+
+        # Build the SQL with ts_rank for relevance scoring
+        where_parts = [
+            f"to_tsvector('{config}', {table_name}.text) @@ plainto_tsquery('{config}', %s)"
+        ]
+        params = [query_str]
+
+        if filter_clause:
+            where_parts.append(f"({filter_clause})")
+
+        where_sql = " AND ".join(where_parts)
+
+        sql = (
+            f"SELECT id, text, embedding, metadata_, ref_doc_id, "
+            f"ts_rank(to_tsvector('{config}', {table_name}.text), "
+            f"plainto_tsquery('{config}', %s)) AS rank "
+            f"FROM {table_name} "
+            f"WHERE {where_sql} "
+            f"ORDER BY rank DESC "
+            f"LIMIT %s"
+        )
+        params.insert(1, query_str)  # ts_rank needs the query too
+        params.append(limit)
+
+        with psycopg.connect(self.connection_string) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                columns = [desc[0] for desc in cur.description] if cur.description else []
+                rows = cur.fetchall()
+
+        # Convert rows to dict-like objects
+        results = []
+        for row in rows:
+            row_dict = dict(zip(columns, row))
+            results.append(row_dict)
+
+        return self._sparse_results_to_query_result(results)
+
+    def _hybrid_query(
+        self,
+        query: VectorStoreQuery,
+        **kwargs: Any,
+    ) -> VectorStoreQueryResult:
+        """HYBRID search: dense vector + sparse text with RRF merge.
+
+        Performs both a dense vector search and a sparse text search,
+        then merges results using Reciprocal Rank Fusion (RRF).
+
+        ADAPT: pyvastbase's ``hybrid_search`` is designed for multi-vector
+        hybrid search.  For vector + text hybrid, we run both searches
+        independently and merge with RRF in Python.
+
+        Args:
+            query: ``VectorStoreQuery`` with both ``query_embedding`` and
+                ``query_str`` populated.
+            **kwargs: Additional search parameters.
+
+        Returns:
+            ``VectorStoreQueryResult`` with RRF-merged results.
+
+        Raises:
+            ValueError: If ``query_embedding`` or ``query_str`` is ``None``.
+        """
+        if query.query_embedding is None:
+            raise ValueError(
+                "query_embedding is required for HYBRID mode"
+            )
+        if not query.query_str:
+            raise ValueError(
+                "query_str is required for HYBRID mode"
+            )
+
+        hybrid_top_k = query.hybrid_top_k or query.similarity_top_k
+        sparse_top_k = query.sparse_top_k or query.similarity_top_k
+
+        # 1. Dense vector search
+        dense_results = self.client.search(
+            self.table_name,
+            data=[query.query_embedding],
+            anns_field="embedding",
+            param={"metric_type": "COSINE"},
+            limit=query.similarity_top_k,
+            expr=self._build_filter_clause(query.filters) or None,
+            output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
+        )
+
+        # 2. Sparse text search
+        sparse_query = VectorStoreQuery(
+            query_str=query.query_str,
+            similarity_top_k=sparse_top_k,
+            filters=query.filters,
+            mode=VectorStoreQueryMode.SPARSE,
+            sparse_top_k=sparse_top_k,
+        )
+        sparse_result = self._build_sparse_query(sparse_query, **kwargs)
+
+        # 3. Convert results to DBEmbeddingRow-like format for RRF merge
+        dense_rows = self._search_result_to_rows(dense_results, is_dense=True)
+        sparse_rows = self._sparse_result_to_rows(sparse_result)
+
+        # 4. RRF merge
+        merged_rows = _rrf_merge(
+            dense_rows=dense_rows,
+            sparse_rows=sparse_rows,
+            k=60,
+            limit=hybrid_top_k,
+        )
+
+        # 5. Convert to VectorStoreQueryResult
+        nodes = []
+        similarities = []
+        ids = []
+        for row in merged_rows:
+            nodes.append(row["node"])
+            similarities.append(row["similarity"])
+            ids.append(row["node_id"])
+
+        return VectorStoreQueryResult(
+            nodes=nodes,
+            similarities=similarities,
+            ids=ids,
+        )
+
+    def _mmr_query(
+        self,
+        query: VectorStoreQuery,
+        **kwargs: Any,
+    ) -> VectorStoreQueryResult:
+        """MMR (Maximal Marginal Relevance) query.
+
+        Prefetches ``prefetch_k`` candidates via dense vector search, then
+        applies the MMR algorithm to balance relevance and diversity.
+
+        ADAPT: Uses ``get_top_k_mmr_embeddings`` from LlamaIndex core, which
+        is framework-agnostic and works with any embedding vectors.
+
+        Args:
+            query: ``VectorStoreQuery`` with ``query_embedding`` populated
+                and ``mode`` set to ``MMR``.
+            **kwargs: Additional parameters:
+                - ``mmr_threshold``: Float in [0, 1]. Default depends on
+                  LlamaIndex core.
+                - ``mmr_prefetch_factor``: Multiplier for prefetch count.
+                  Default is 4 (PGVectorStore default).
+                - ``mmr_prefetch_k``: Explicit prefetch count (overrides
+                  ``mmr_prefetch_factor``).
+
+        Returns:
+            ``VectorStoreQueryResult`` with MMR-reranked nodes.
+        """
+        from llama_index.core.indices.query.embedding_utils import (
+            get_top_k_mmr_embeddings,
+        )
+
+        embedding = query.query_embedding
+        if embedding is None:
+            raise ValueError(
+                "query_embedding is required for MMR mode"
+            )
+
+        # Compute prefetch_k
+        mmr_prefetch_k = kwargs.get("mmr_prefetch_k")
+        if mmr_prefetch_k is not None:
+            prefetch_k = int(mmr_prefetch_k)
+        else:
+            mmr_prefetch_factor = kwargs.get("mmr_prefetch_factor", 4)
+            prefetch_k = int(query.similarity_top_k * mmr_prefetch_factor)
+        prefetch_k = max(prefetch_k, query.similarity_top_k)
+
+        mmr_threshold = (
+            query.mmr_threshold
+            if query.mmr_threshold is not None
+            else kwargs.get("mmr_threshold")
+        )
+
+        # Prefetch candidates via dense vector search (with embeddings)
+        filter_expr = self._build_filter_clause(query.filters) or None
+
+        results = self.client.search(
+            self.table_name,
+            data=[embedding],
+            anns_field="embedding",
+            param={"metric_type": "COSINE"},
+            limit=prefetch_k,
+            expr=filter_expr,
+            output_fields=["id", "text", "embedding", "metadata_", "ref_doc_id"],
+        )
+
+        # Extract embeddings and node data
+        result_items = results.get_result(0) if hasattr(results, 'get_result') else results[0]
+
+        embeddings = []
+        node_ids = []
+        rows_map = {}
+        for item in result_items:
+            item_data = item.data if hasattr(item, 'data') else item
+            item_id = item.id if hasattr(item, 'id') else item_data.get("id")
+            item_embedding = item_data.get("embedding", []) if isinstance(item_data, dict) else getattr(item_data, "embedding", [])
+
+            if item_embedding:
+                embeddings.append(list(item_embedding) if not isinstance(item_embedding, list) else item_embedding)
+                node_ids.append(item_id)
+            # Store for later reconstruction
+            rows_map[item_id] = item
+
+        if not embeddings or len(embeddings) < query.similarity_top_k:
+            # Fallback: return results as-is if not enough valid embeddings
+            _logger.debug(
+                "MMR: insufficient valid embeddings (%d < %d), falling back to "
+                "dense search results",
+                len(embeddings),
+                query.similarity_top_k,
+            )
+            return self._search_results_to_query_result(results)
+
+        # Apply MMR algorithm
+        mmr_similarities, mmr_ids = get_top_k_mmr_embeddings(
+            query_embedding=embedding,
+            embeddings=embeddings,
+            similarity_top_k=query.similarity_top_k,
+            embedding_ids=node_ids,
+            mmr_threshold=mmr_threshold,
+        )
+
+        # Reconstruct ordered results
+        nodes = []
+        similarities = []
+        ids = []
+        for score, node_id in zip(mmr_similarities, mmr_ids):
+            if node_id in rows_map:
+                item = rows_map[node_id]
+                item_data = item.data if hasattr(item, 'data') else item
+                text = item_data.get("text", "") if isinstance(item_data, dict) else getattr(item_data, "text", "")
+                metadata = item_data.get("metadata_", {}) if isinstance(item_data, dict) else getattr(item_data, "metadata_", {})
+                ref_doc_id = item_data.get("ref_doc_id", "") if isinstance(item_data, dict) else getattr(item_data, "ref_doc_id", "")
+
+                node = TextNode(
+                    id_=node_id,
+                    text=text,
+                    embedding=item_data.get("embedding") if isinstance(item_data, dict) else getattr(item_data, "embedding", None),
+                    metadata=metadata or {},
+                )
+                if ref_doc_id:
+                    node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                        node_id=ref_doc_id
+                    )
+                nodes.append(node)
+                similarities.append(score)
+                ids.append(node_id)
+
+        return VectorStoreQueryResult(
+            nodes=nodes,
+            similarities=similarities,
+            ids=ids,
+        )
+
+    # ── Result conversion helpers ─────────────────────────────────────────
+
+    def _search_results_to_query_result(
+        self,
+        results: Any,
+    ) -> VectorStoreQueryResult:
+        """Convert pyvastbase ``SearchResult`` to ``VectorStoreQueryResult``.
+
+        Args:
+            results: ``SearchResult`` from ``VastbaseClient.search()``.
+
+        Returns:
+            ``VectorStoreQueryResult`` with nodes, similarities, and IDs.
+        """
+        nodes = []
+        similarities = []
+        ids = []
+
+        # Handle SearchResult with get_result() method
+        if hasattr(results, 'get_result'):
+            result_items = results.get_result(0)
+        elif hasattr(results, '__getitem__'):
+            result_items = results[0] if results else []
+        else:
+            result_items = results or []
+
+        for item in result_items:
+            # SearchResultItem has .id, .distance, .data (dict)
+            if hasattr(item, 'data'):
+                item_data = item.data
+                item_id = item.id
+                item_distance = item.distance
+            elif isinstance(item, dict):
+                item_data = item
+                item_id = item.get("id")
+                item_distance = item.get("distance", 0)
+            else:
+                item_data = {}
+                item_id = getattr(item, "id", None)
+                item_distance = getattr(item, "distance", 0)
+
+            text = item_data.get("text", "") if isinstance(item_data, dict) else getattr(item_data, "text", "")
+            metadata = item_data.get("metadata_", {}) if isinstance(item_data, dict) else getattr(item_data, "metadata_", {})
+            embedding = item_data.get("embedding") if isinstance(item_data, dict) else getattr(item_data, "embedding", None)
+            ref_doc_id = item_data.get("ref_doc_id", "") if isinstance(item_data, dict) else getattr(item_data, "ref_doc_id", "")
+
+            # ADAPT: cosine distance → similarity: similarity = 1 - distance
+            similarity = 1.0 - item_distance
+
+            node = TextNode(
+                id_=item_id,
+                text=text,
+                embedding=embedding,
+                metadata=metadata or {},
+            )
+            if ref_doc_id:
+                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                    node_id=ref_doc_id
+                )
+
+            nodes.append(node)
+            similarities.append(similarity)
+            ids.append(item_id)
+
+        return VectorStoreQueryResult(
+            nodes=nodes,
+            similarities=similarities,
+            ids=ids,
+        )
+
+    def _sparse_results_to_query_result(
+        self,
+        rows: List[Dict[str, Any]],
+    ) -> VectorStoreQueryResult:
+        """Convert sparse (full-text search) rows to ``VectorStoreQueryResult``.
+
+        Args:
+            rows: List of dicts from raw SQL execution with keys
+                ``id``, ``text``, ``metadata_``, ``embedding``,
+                ``ref_doc_id``, ``rank``.
+
+        Returns:
+            ``VectorStoreQueryResult``.
+        """
+        nodes = []
+        similarities = []
+        ids = []
+
+        for row in rows:
+            node_id = row.get("id")
+            text = row.get("text", "")
+            metadata = row.get("metadata_", {}) or {}
+            embedding = row.get("embedding")
+            ref_doc_id = row.get("ref_doc_id", "")
+            rank = row.get("rank", 0.0)
+
+            node = TextNode(
+                id_=node_id,
+                text=text,
+                embedding=embedding,
+                metadata=metadata,
+            )
+            if ref_doc_id:
+                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                    node_id=ref_doc_id
+                )
+
+            nodes.append(node)
+            # ts_rank values are used directly as similarity scores
+            similarities.append(float(rank) if rank else 0.0)
+            ids.append(node_id)
+
+        return VectorStoreQueryResult(
+            nodes=nodes,
+            similarities=similarities,
+            ids=ids,
+        )
+
+    @staticmethod
+    def _search_result_to_rows(
+        results: Any,
+        is_dense: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Convert SearchResult to a list of row dicts for RRF merge.
+
+        Args:
+            results: ``SearchResult`` from ``VastbaseClient.search()``.
+            is_dense: If True, compute similarity from cosine distance.
+
+        Returns:
+            List of row dicts with keys ``node_id``, ``similarity``, ``node``.
+        """
+        rows = []
+        if hasattr(results, 'get_result'):
+            items = results.get_result(0)
+        elif hasattr(results, '__getitem__'):
+            items = results[0] if results else []
+        else:
+            items = results or []
+
+        for rank, item in enumerate(items):
+            if hasattr(item, 'data'):
+                item_data = item.data
+                item_id = item.id
+                item_distance = item.distance
+            elif isinstance(item, dict):
+                item_data = item
+                item_id = item.get("id")
+                item_distance = item.get("distance", 0)
+            else:
+                continue
+
+            text = item_data.get("text", "") if isinstance(item_data, dict) else getattr(item_data, "text", "")
+            metadata = item_data.get("metadata_", {}) if isinstance(item_data, dict) else getattr(item_data, "metadata_", {})
+            embedding = item_data.get("embedding") if isinstance(item_data, dict) else getattr(item_data, "embedding", None)
+            ref_doc_id = item_data.get("ref_doc_id", "") if isinstance(item_data, dict) else getattr(item_data, "ref_doc_id", "")
+
+            similarity = (1.0 - item_distance) if is_dense else item_distance
+
+            node = TextNode(
+                id_=item_id,
+                text=text,
+                embedding=embedding,
+                metadata=metadata or {},
+            )
+            if ref_doc_id:
+                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                    node_id=ref_doc_id
+                )
+
+            rows.append({
+                "node_id": item_id,
+                "similarity": similarity,
+                "node": node,
+                "rank": rank,
+            })
+
+        return rows
+
+    @staticmethod
+    def _sparse_result_to_rows(
+        result: VectorStoreQueryResult,
+    ) -> List[Dict[str, Any]]:
+        """Convert sparse query result to row dicts for RRF merge.
+
+        Args:
+            result: ``VectorStoreQueryResult`` from ``_build_sparse_query``.
+
+        Returns:
+            List of row dicts.
+        """
+        rows = []
+        for rank, (node_id, similarity, node) in enumerate(
+            zip(result.ids, result.similarities, result.nodes)
+        ):
+            rows.append({
+                "node_id": node_id,
+                "similarity": similarity,
+                "node": node,
+                "rank": rank,
+            })
+        return rows
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Module-level helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _dedup_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicate rows by node_id, keeping first occurrence.
+
+    Args:
+        rows: List of row dicts with ``node_id`` key.
+
+    Returns:
+        Deduplicated list.
+    """
+    seen_ids: Set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for row in rows:
+        nid = row.get("node_id") if isinstance(row, dict) else getattr(row, "node_id", None)
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            deduped.append(row)
+    return deduped
+
+
+def _rrf_merge(
+    dense_rows: List[Dict[str, Any]],
+    sparse_rows: List[Dict[str, Any]],
+    k: int = 60,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Merge dense and sparse results using Reciprocal Rank Fusion (RRF).
+
+    ADAPT: RRF is a rank-based fusion algorithm that does not require
+    score normalization.  Higher RRF scores indicate a result appeared
+    higher in more lists.
+
+    Args:
+        dense_rows: Rows from dense vector search.
+        sparse_rows: Rows from sparse text search.
+        k: RRF constant (default 60).  Higher values dampen rank differences.
+        limit: Maximum number of results to return.
+
+    Returns:
+        RRF-merged and sorted list of row dicts.
+    """
+    scores: Dict[str, float] = {}
+    best_item: Dict[str, Dict[str, Any]] = {}
+
+    # Score dense results
+    for rank, row in enumerate(dense_rows):
+        nid = row["node_id"]
+        scores[nid] = scores.get(nid, 0.0) + 1.0 / (k + rank)
+        if nid not in best_item:
+            best_item[nid] = row
+
+    # Score sparse results
+    for rank, row in enumerate(sparse_rows):
+        nid = row["node_id"]
+        scores[nid] = scores.get(nid, 0.0) + 1.0 / (k + rank)
+        if nid not in best_item:
+            best_item[nid] = row
+
+    # Sort by RRF score descending
+    sorted_ids = sorted(scores.keys(), key=lambda nid: scores[nid], reverse=True)
+    sorted_ids = sorted_ids[:limit]
+
+    result = []
+    for nid in sorted_ids:
+        row = best_item[nid]
+        row["similarity"] = scores[nid]  # Set RRF score as similarity
+        result.append(row)
+
+    return result
