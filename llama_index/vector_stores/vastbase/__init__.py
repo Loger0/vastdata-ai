@@ -6,6 +6,8 @@
 from llama_index.vector_stores.vastbase.base import (
     VastbaseVectorStore,
     _map_text_search_config,
+    DBEmbeddingRow,
+    DEFAULT_MMR_PREFETCH_FACTOR,
 )
 from llama_index.vector_stores.vastbase.utils import (
     _to_vastbase_filter,
@@ -17,4 +19,6 @@ __all__ = [
     "_to_vastbase_filter",
     "_escape_value",
     "_map_text_search_config",
+    "DBEmbeddingRow",
+    "DEFAULT_MMR_PREFETCH_FACTOR",
 ]

@@ -31,6 +31,16 @@ from llama_index.core.indices.query.embedding_utils import (
     get_top_k_mmr_embeddings,
 )
 
+# ADAPT: SQLAlchemy imports for PGVectorStore-compatible fixtures
+# (second_table, pg_custom_query).  These are only needed for the
+# customize_query_fn fixture path — pyvastbase does NOT use SQLAlchemy
+# internally, but the test fixtures reference SQLAlchemy types.
+try:
+    from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, insert
+    from sqlalchemy import Select
+except ImportError:
+    Table = None  # type: ignore[assignment]
+
 # from testing find install here https://github.com/pgvector/pgvector#installation-notes
 
 PARAMS: Dict[str, Union[str, int]] = {
