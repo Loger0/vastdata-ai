@@ -60,112 +60,112 @@ class TestEscapeValue:
 # ── _to_vastbase_filter operator tests ───────────────────────────────
 
 class TestOperatorEQ:
-    """EQ operator → key = value."""
+    """EQ operator → "key" = value."""
 
     def test_eq_string(self):
         mf = MetadataFilter(key="name", value="test", operator=FilterOperator.EQ)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "name = 'test'"
+        assert result == '"name" = \'test\''
 
     def test_eq_integer(self):
         mf = MetadataFilter(key="count", value=10, operator=FilterOperator.EQ)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "count = 10"
+        assert result == '"count" = 10'
 
 
 class TestOperatorGT:
-    """GT operator → key > value."""
+    """GT operator → "key" > value."""
 
     def test_gt(self):
         mf = MetadataFilter(key="score", value=0.5, operator=FilterOperator.GT)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "score > 0.5"
+        assert result == '"score" > 0.5'
 
 
 class TestOperatorLT:
-    """LT operator → key < value."""
+    """LT operator → "key" < value."""
 
     def test_lt(self):
         mf = MetadataFilter(key="age", value=100, operator=FilterOperator.LT)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "age < 100"
+        assert result == '"age" < 100'
 
 
 class TestOperatorGTE:
-    """GTE operator → key >= value."""
+    """GTE operator → "key" >= value."""
 
     def test_gte(self):
         mf = MetadataFilter(key="price", value=9.99, operator=FilterOperator.GTE)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "price >= 9.99"
+        assert result == '"price" >= 9.99'
 
 
 class TestOperatorLTE:
-    """LTE operator → key <= value."""
+    """LTE operator → "key" <= value."""
 
     def test_lte(self):
         mf = MetadataFilter(key="stock", value=0, operator=FilterOperator.LTE)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "stock <= 0"
+        assert result == '"stock" <= 0'
 
 
 class TestOperatorNE:
-    """NE operator → key != value."""
+    """NE operator → "key" != value."""
 
     def test_ne(self):
         mf = MetadataFilter(key="status", value="deleted", operator=FilterOperator.NE)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "status != 'deleted'"
+        assert result == "\"status\" != 'deleted'"
 
 
 class TestOperatorIN:
-    """IN operator → key IN (...)."""
+    """IN operator → "key" IN (...)."""
 
     def test_in(self):
         mf = MetadataFilter(key="color", value=["red", "green", "blue"], operator=FilterOperator.IN)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "color IN ('red', 'green', 'blue')"
+        assert result == "\"color\" IN ('red', 'green', 'blue')"
 
 
 class TestOperatorNIN:
-    """NIN operator → key NOT IN (...)."""
+    """NIN operator → "key" NOT IN (...)."""
 
     def test_nin(self):
         mf = MetadataFilter(key="category", value=[1, 2, 3], operator=FilterOperator.NIN)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "category NOT IN (1, 2, 3)"
+        assert result == "\"category\" NOT IN (1, 2, 3)"
 
 
 class TestOperatorTEXTMATCH:
-    """TEXT_MATCH operator → key LIKE '%value%'."""
+    """TEXT_MATCH operator → "key" LIKE '%value%'."""
 
     def test_text_match(self):
         # ADAPT: LIKE with % wildcards is standard SQL, Vastbase-compatible
         mf = MetadataFilter(key="description", value="vector", operator=FilterOperator.TEXT_MATCH)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "description LIKE '%vector%'"
+        assert result == "\"description\" LIKE '%vector%'"
 
     def test_text_match_with_single_quote(self):
         """Single quotes in value must be escaped to prevent SQL injection."""
         mf = MetadataFilter(key="desc", value="it's tricky", operator=FilterOperator.TEXT_MATCH)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "desc LIKE '%it''s tricky%'"
+        assert result == "\"desc\" LIKE '%it''s tricky%'"
 
     def test_text_match_with_percent(self):
         """Percent sign in value — LIKE wildcard, stored as literal."""
         mf = MetadataFilter(key="desc", value="100%", operator=FilterOperator.TEXT_MATCH)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "desc LIKE '%100%%'"
+        assert result == "\"desc\" LIKE '%100%%'"
 
     def test_text_match_with_underscore(self):
         """Underscore in value — LIKE wildcard, stored as literal."""
         mf = MetadataFilter(key="desc", value="hello_world", operator=FilterOperator.TEXT_MATCH)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "desc LIKE '%hello_world%'"
+        assert result == "\"desc\" LIKE '%hello_world%'"
 
 
 class TestOperatorCONTAINS:
-    """CONTAINS operator → key @> 'value'::jsonb (JSONB containment)."""
+    """CONTAINS operator → "key" @> 'value'::jsonb (JSONB containment)."""
 
     def test_contains(self):
         # ADAPT: JSONB containment check using @> operator
@@ -177,7 +177,7 @@ class TestOperatorCONTAINS:
 
 
 class TestOperatorISEMPTY:
-    """IS_EMPTY operator → (key IS NULL OR key = '')."""
+    """IS_EMPTY operator → ("key" IS NULL OR "key" = '')."""
 
     def test_is_empty(self):
         mf = MetadataFilter(key="deleted_at", value=None, operator=FilterOperator.IS_EMPTY)
@@ -188,7 +188,7 @@ class TestOperatorISEMPTY:
 
 
 class TestOperatorANY:
-    """ANY operator → key ?| array[...] (JSONB any-of check)."""
+    """ANY operator → "key" ?| array[...] (JSONB any-of check)."""
 
     def test_any_strings(self):
         # ADAPT: JSONB ?| operator checks if array contains ANY of the values
@@ -214,7 +214,7 @@ class TestOperatorANY:
 
 
 class TestOperatorALL:
-    """ALL operator → key ?& array[...] (JSONB all-of check)."""
+    """ALL operator → "key" ?& array[...] (JSONB all-of check)."""
 
     def test_all_strings(self):
         # ADAPT: JSONB ?& operator checks if array contains ALL of the values
@@ -240,7 +240,7 @@ class TestANDCombination:
         result = _to_vastbase_filter(
             MetadataFilters(filters=[f1, f2], condition=FilterCondition.AND)
         )
-        assert result == "(x = 1) AND (y > 2)"
+        assert result == '("x" = 1) AND ("y" > 2)'
 
     def test_three_filters_and(self):
         f1 = MetadataFilter(key="a", value=1, operator=FilterOperator.EQ)
@@ -249,7 +249,7 @@ class TestANDCombination:
         result = _to_vastbase_filter(
             MetadataFilters(filters=[f1, f2, f3], condition=FilterCondition.AND)
         )
-        assert result == "(a = 1) AND (b = 2) AND (c = 3)"
+        assert result == '("a" = 1) AND ("b" = 2) AND ("c" = 3)'
 
 
 class TestORCombination:
@@ -261,7 +261,7 @@ class TestORCombination:
         result = _to_vastbase_filter(
             MetadataFilters(filters=[f1, f2], condition=FilterCondition.OR)
         )
-        assert result == "(status = 'active') OR (status = 'pending')"
+        assert result == "(\"status\" = 'active') OR (\"status\" = 'pending')"
 
 
 class TestNOTCondition:
@@ -274,7 +274,7 @@ class TestNOTCondition:
         )
         # NOT should wrap the expression
         assert "NOT" in result
-        assert "deleted = 1" in result
+        assert '"deleted" = 1' in result
 
 
 # ── Nested / complex tests ───────────────────────────────────────────
@@ -283,7 +283,7 @@ class TestNestedFilters:
     """Deeply nested MetadataFilters (list-of-lists recursion)."""
 
     def test_nested_and_or(self):
-        # (a = 1 OR b = 2) AND (c = 3)
+        # ("a" = 1 OR "b" = 2) AND ("c" = 3)
         inner1 = MetadataFilters(
             filters=[
                 MetadataFilter(key="a", value=1, operator=FilterOperator.EQ),
@@ -302,13 +302,13 @@ class TestNestedFilters:
             condition=FilterCondition.AND,
         )
         result = _to_vastbase_filter(outer)
-        assert "(a = 1) OR (b = 2)" in result
-        assert "c = 3" in result
+        assert '("a" = 1) OR ("b" = 2)' in result
+        assert '"c" = 3' in result
         assert result.startswith("(")
         assert result.endswith(")")
 
     def test_three_level_nesting(self):
-        # ((x = 1) AND (y = 2 OR z = 3))
+        # (("x" = 1) AND (("y" = 2) OR ("z" = 3)))
         innermost = MetadataFilters(
             filters=[
                 MetadataFilter(key="y", value=2, operator=FilterOperator.EQ),
@@ -324,9 +324,9 @@ class TestNestedFilters:
             condition=FilterCondition.AND,
         )
         result = _to_vastbase_filter(middle)
-        assert "x = 1" in result
-        assert "y = 2" in result
-        assert "z = 3" in result
+        assert '"x" = 1' in result
+        assert '"y" = 2' in result
+        assert '"z" = 3' in result
 
 
 # ── Edge cases ───────────────────────────────────────────────────────
@@ -343,7 +343,7 @@ class TestEdgeCases:
         """Single filter with default condition should not add extra parens."""
         mf = MetadataFilter(key="id", value=100, operator=FilterOperator.EQ)
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "id = 100"
+        assert result == '"id" = 100'
 
     def test_single_filter_default_and(self):
         """Single filter with explicit AND — same as default."""
@@ -351,7 +351,7 @@ class TestEdgeCases:
         result = _to_vastbase_filter(
             MetadataFilters(filters=[mf], condition=FilterCondition.AND)
         )
-        assert result == "id = 100"
+        assert result == '"id" = 100'
 
 
 # ── TEXT_MATCH_INSENSITIVE ───────────────────────────────────────────
@@ -365,7 +365,7 @@ class TestTextMatchInsensitive:
             operator=FilterOperator.TEXT_MATCH_INSENSITIVE,
         )
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "title ILIKE '%hello%'"
+        assert result == "\"title\" ILIKE '%hello%'"
 
     def test_text_match_insensitive_with_single_quote(self):
         """Single quotes escaped in ILIKE value."""
@@ -374,7 +374,7 @@ class TestTextMatchInsensitive:
             operator=FilterOperator.TEXT_MATCH_INSENSITIVE,
         )
         result = _to_vastbase_filter(MetadataFilters(filters=[mf]))
-        assert result == "title ILIKE '%it''s a test%'"
+        assert result == "\"title\" ILIKE '%it''s a test%'"
 
 
 # ── Key prefix (metadata_->> JSON column) tests ──────────────────────

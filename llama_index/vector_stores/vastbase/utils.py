@@ -115,8 +115,10 @@ def _render_metadata_filter(mf: MetadataFilter, key_prefix: str = "") -> str:
         # JSONB path: metadata_->'key' (returns jsonb, for ?|, ?&, @>)
         key_ref_json = f"{key_prefix}->'{key}'"
     else:
-        key_ref = key
-        key_ref_json = key
+        # ADAPT: Double-quote bare identifier to protect reserved words
+        # (e.g. "group", "order") when used in raw SQL WHERE clauses.
+        key_ref = f'"{key}"'
+        key_ref_json = f'"{key}"'
 
     if op in _OPERATOR_MAP:
         return f"{key_ref} {_OPERATOR_MAP[op]} {_escape_value(value)}"

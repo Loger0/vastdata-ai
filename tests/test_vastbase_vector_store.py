@@ -1134,7 +1134,6 @@ class TestAsyncCRUD:
 
     @pytest.mark.asyncio
     async def test_async_add_nodes(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         mock_client.has_collection.return_value = True
@@ -1144,7 +1143,6 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         node = TextNode(
             id_="async-1",
@@ -1155,11 +1153,10 @@ class TestAsyncCRUD:
         node_ids = await store.async_add([node])
 
         assert node_ids == ["async-1"]
-        store._async_collection.insert.assert_called_once()
+        mock_client.insert.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_async_add_multiple_nodes(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         mock_client.has_collection.return_value = True
@@ -1169,7 +1166,6 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         nodes = [
             TextNode(id_="a1", text="A", embedding=[0.1]),
@@ -1179,12 +1175,12 @@ class TestAsyncCRUD:
         node_ids = await store.async_add(nodes)
 
         assert node_ids == ["a1", "a2", "a3"]
-        inserted = store._async_collection.insert.call_args[0][0]
+        mock_client.insert.assert_called_once()
+        inserted = mock_client.insert.call_args[0][1]
         assert len(inserted) == 3
 
     @pytest.mark.asyncio
     async def test_adelete_by_ref_doc_id(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
@@ -1193,17 +1189,15 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         await store.adelete("doc-123")
 
-        store._async_collection.delete.assert_called_once()
-        call_expr = store._async_collection.delete.call_args[1]["expr"]
+        mock_client.delete.assert_called_once()
+        call_expr = mock_client.delete.call_args[1]["expr"]
         assert "doc-123" in call_expr
 
     @pytest.mark.asyncio
     async def test_adelete_empty_ref_doc_id_raises(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
@@ -1212,14 +1206,12 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         with pytest.raises(ValueError, match="ref_doc_id must be a non-empty string"):
             await store.adelete("")
 
     @pytest.mark.asyncio
     async def test_adelete_nodes_by_ids(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
@@ -1228,19 +1220,17 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         await store.adelete_nodes(["n1", "n2", "n3"])
 
-        store._async_collection.delete.assert_called_once()
-        call_expr = store._async_collection.delete.call_args[1]["expr"]
+        mock_client.delete.assert_called_once()
+        call_expr = mock_client.delete.call_args[1]["expr"]
         assert "n1" in call_expr
         assert "n2" in call_expr
         assert "n3" in call_expr
 
     @pytest.mark.asyncio
     async def test_adelete_nodes_empty_list(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
@@ -1249,15 +1239,13 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         await store.adelete_nodes([])
 
-        store._async_collection.delete.assert_not_called()
+        mock_client.delete.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_aget_nodes(self, mock_client):
-        from unittest.mock import AsyncMock
         from llama_index.vector_stores.vastbase.base import VastbaseVectorStore
 
         store = VastbaseVectorStore(
@@ -1265,13 +1253,11 @@ class TestAsyncCRUD:
             table_name="test_nodes",
             dimension=128,
         )
-        store._client = mock_client
-        async_mock = AsyncMock()
-        async_mock.query.return_value = [
+        mock_client.query.return_value = [
             {"id": "n1", "text": "Hello", "metadata_": {"k": "v"}, "ref_doc_id": "doc-1"},
             {"id": "n3", "text": "World", "metadata_": {}, "ref_doc_id": "doc-3"},
         ]
-        store._async_collection = async_mock
+        store._client = mock_client
 
         nodes = await store.aget_nodes(["n1", "n3"])
 
@@ -1292,12 +1278,11 @@ class TestAsyncCRUD:
             dimension=128,
         )
         store._client = mock_client
-        store._async_collection = AsyncMock()
 
         nodes = await store.aget_nodes([])
 
         assert nodes == []
-        store._async_collection.query.assert_not_called()
+        mock_client.query.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_aclear(self, mock_client):
