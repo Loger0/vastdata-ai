@@ -51,18 +51,36 @@ python -c "from llama_index.vector_stores.vastbase import VastbaseVectorStore; p
 pytest tests/ -v
 ```
 
-预期：全部 PASS（73 tests）
+预期：全部 PASS（231 tests）
+
+### 框架级集成验收测试
+
+```bash
+# 设置 Vastbase 连接环境变量
+export VASTBASE_HOST=172.16.105.107
+export VASTBASE_PORT=15432
+export VASTBASE_DATABASE=vastbase
+export VASTBASE_USER=aidev
+export VASTBASE_PASSWORD=Vbase_123456
+
+# 运行框架级集成验收
+pytest tests/test_framework_integration.py -v
+```
+
+验收覆盖 6 大场景：文档摄入 / DENSE向量搜索 / HYBRID混合搜索 / 元数据过滤 / 异步API / 表复用
 
 ### 测试分类
 
 | 测试类别 | 文件 | 测试数 |
 |---------|------|--------|
-| Filter 翻译 | `tests/test_filter_translation.py` | 36 |
+| Filter 翻译 | `tests/test_filter_translation.py` | 43 |
 | CRUD | `tests/test_vastbase_vector_store.py` | 23 |
-| DENSE 搜索 | `tests/test_vastbase_vector_store.py` | 5 |
-| HYBRID 搜索 | `tests/test_vastbase_vector_store.py` | 3 |
-| TEXT_SEARCH | `tests/test_vastbase_vector_store.py` | 4 |
-| 降级路径 | `tests/test_vastbase_vector_store.py` | 2 |
+| DENSE/HYBRID/TEXT 搜索 | `tests/test_vastbase_vector_store.py` | 12 |
+| 初始化/异步 | `tests/test_vastbase_vector_store.py` | 14 |
+| 包完整性 | `tests/test_integration.py` | 7 |
+| 集成测试 | `tests/test_integration.py` | 37 |
+| 查询引擎 | `tests/test_query_engine.py` | 12 |
+| 框架级集成验收 | `tests/test_framework_integration.py` | 23 |
 
 ## 在 LlamaIndex 中使用
 

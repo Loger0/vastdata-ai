@@ -50,6 +50,17 @@
 
 | 层级 | 用例数 | 来源 |
 |------|--------|------|
-| 单元测试 | 73 | adapter-dev (filter翻译 36 + CRUD+搜索 37) |
-| 框架官方测试 | 0 | test-scout 尚未提供 |
-| 补充测试 | 0 | test-adapter 审查后认为覆盖充分 |
+| 单元测试 | 231 | adapter-dev (filter翻译 43 + CRUD/搜索 49 + 初始化 9 + Async 9 + 查询引擎 12 + Package integrity 7 + other) |
+| 框架级集成验收 | 23 | test-adapter Flow C (6 scenarios + MMR + edge cases) |
+| 官方测试套件 | 74 | framework-tests/ (test-scout) |
+
+## 已验证的适配修复（Flow C 框架集成验收）
+
+| 根因 | 修复 | 影响 |
+|------|------|------|
+| DistanceType 枚举不匹配 | `metric_type` 值改为 lowercase (`"cosine"`) | DENSE/HYBRID/MMR 搜索 |
+| `_VastbaseWrapper.search()` 参数名错误 | `filter_expr` → `expr` 正确映射到 Collection.search() | 元数据过滤 + HYBRID 搜索 |
+| Filter 生成未引用列名 | 裸标识符加双引号保护保留字 | 元数据过滤（如 `"group"`） |
+| Filter 未加 JSONB 列前缀 | `_build_filter_clause` 默认 `key_prefix="metadata_"` | 元数据过滤在 JSONB 列上正确生效 |
+| 向量字符串解析缺失 | sparse_results + MMR 路径增加 `json.loads()` 解析 | SPARSE/HYBRID/MMR 结果正确 |
+| pyvastbase 0.2.7 AsyncCollection bug | 异步方法回退到 `asyncio.to_thread()` | 异步 API 可用 |
