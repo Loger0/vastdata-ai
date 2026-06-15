@@ -1788,6 +1788,9 @@ class VastbaseVectorStore(BasePydanticVectorStore):
     ) -> TextNode:
         """Build a ``TextNode`` from extracted result item data.
 
+        ADAPT: mirrors ``_dict_to_node`` vector/metadata parsing for
+        consistency across all result paths (dense/sparse/hybrid/MMR).
+
         Args:
             item_id: The node id.
             data: Dict with keys ``text``, ``metadata_``, ``embedding``,
@@ -1796,11 +1799,28 @@ class VastbaseVectorStore(BasePydanticVectorStore):
         Returns:
             ``TextNode`` populated from the data.
         """
+        embedding: Optional[List[float]] = data.get("embedding")
+        # ADAPT: pyvastbase returns vectors as strings (e.g. '[0.1,0.2,0.3]').
+        # Parse them back to Python lists for LlamaIndex TextNode.
+        if isinstance(embedding, str):
+            try:
+                embedding = json.loads(embedding)
+            except (json.JSONDecodeError, TypeError):
+                embedding = None
+        metadata: dict = data.get("metadata_", {}) or {}
+        # ADAPT: metadata_ is stored as JSON string for psycopg compatibility;
+        # parse it back to a dict if it's still a string.
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+
         node = TextNode(
             id_=item_id,
             text=data.get("text", ""),
-            embedding=data.get("embedding"),
-            metadata=data.get("metadata_", {}) or {},
+            embedding=embedding,
+            metadata=metadata,
         )
         ref_doc_id = data.get("ref_doc_id", "")
         if ref_doc_id:
