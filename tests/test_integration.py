@@ -25,20 +25,6 @@ from llama_index.core.vector_stores.types import (
 
 # ── Connection helpers ─────────────────────────────────────────────────
 
-def _build_connection_uri() -> str:
-    """Build a Vastbase connection URI from environment variables."""
-    uri = os.environ.get("VASTBASE_URI")
-    if uri:
-        return uri
-
-    host = os.environ.get("VASTBASE_HOST", "127.0.0.1")
-    port = os.environ.get("VASTBASE_PORT", "5432")
-    database = os.environ.get("VASTBASE_DATABASE", "test")
-    user = os.environ.get("VASTBASE_USER", "postgres")
-    password = os.environ.get("VASTBASE_PASSWORD", "Vexdb@123")
-    return f"postgresql://{user}:{password}@{host}:{port}/{database}"
-
-
 def _check_vastbase_reachable() -> bool:
     """Return True if the Vastbase instance is reachable.
 

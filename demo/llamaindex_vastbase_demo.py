@@ -200,7 +200,7 @@ def main() -> None:
         similarity_top_k=2,
         mode=VectorStoreQueryMode.DEFAULT,
     )
-    q7.mode = "mmr"  # type: ignore[assignment]
+    q7.mode = VectorStoreQueryMode.MMR
     r7 = store.query(q7, mmr_threshold=0.5, mmr_lambda=0.7)
     print("\n✅ Scenario 7: MMR diverse re-ranking")
     print(f"   found {len(r7.nodes)} result(s)")

@@ -186,6 +186,7 @@ class _VastbaseWrapper:
             expr=expr,
             limit=limit,
             output_fields=output_fields or [],
+            **kwargs,
         )
 
     def search(
@@ -205,6 +206,7 @@ class _VastbaseWrapper:
             output_fields=output_fields or [],
             filter_expr=filter_expr,
             metric_type=metric_type,
+            **kwargs,
         )
 
     def close(self) -> None:
